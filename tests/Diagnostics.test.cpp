@@ -97,6 +97,72 @@ TEST_CASE_FIXTURE(Fixture, "lua_files_do_not_run_typecheck_or_lint")
     CHECK_EQ(diagnostics.items.size(), 0);
 }
 
+TEST_CASE_FIXTURE(Fixture, "mta_global_function_unused_warning_remains_when_not_used_elsewhere")
+{
+    switchToStandardPlatform();
+
+    tempDir.write_child("meta.xml", R"(
+        <meta>
+            <script src="server.luau" type="server" />
+            <script src="server2.luau" type="server" />
+        </meta>
+    )");
+
+    auto serverDocument = newDocument("server.luau", R"(
+        --!strict
+        function somenteGlobal(test: string): number
+            return 1
+        end
+    )");
+    newDocument("server2.luau", "--!strict\n");
+
+    auto diagnostics = workspace.documentDiagnostics(lsp::DocumentDiagnosticParams{{serverDocument}}, nullptr);
+
+    bool foundUnusedGlobalFunction = false;
+    for (const auto& diagnostic : diagnostics.items)
+    {
+        if (diagnostic.message.find("FunctionUnused: Function 'somenteGlobal' is never used") != std::string::npos)
+        {
+            foundUnusedGlobalFunction = true;
+            break;
+        }
+    }
+
+    CHECK(foundUnusedGlobalFunction);
+}
+
+TEST_CASE_FIXTURE(Fixture, "mta_global_function_unused_warning_clears_when_used_in_visible_file")
+{
+    switchToStandardPlatform();
+
+    tempDir.write_child("meta.xml", R"(
+        <meta>
+            <script src="server.luau" type="server" />
+            <script src="server2.luau" type="server" />
+        </meta>
+    )");
+
+    auto serverDocument = newDocument("server.luau", R"(
+        --!strict
+        function somenteGlobal(test: string): number
+            return 1
+        end
+    )");
+    newDocument("server2.luau", R"(
+        --!strict
+        local x = somenteGlobal("abc")
+    )");
+
+    auto transformedServerDoc = workspace.fileResolver.getTextDocument(serverDocument);
+    REQUIRE(transformedServerDoc != nullptr);
+    CHECK_NE(transformedServerDoc->getText().find("if false then (somenteGlobal :: any)() end"), std::string::npos);
+
+    auto diagnostics = workspace.documentDiagnostics(lsp::DocumentDiagnosticParams{{serverDocument}}, nullptr);
+
+    for (const auto& diagnostic : diagnostics.items)
+        CHECK(diagnostic.message.find("FunctionUnused: Function 'somenteGlobal' is never used") == std::string::npos);
+}
+
 TEST_CASE_FIXTURE(Fixture, "text_document_update_triggers_dependent_diagnostics_in_push_based_diagnostics")
 {
     client->globalConfig.diagnostics.includeDependents = true;

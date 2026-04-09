@@ -148,6 +148,9 @@ public:
     /// Build additional type-only declarations from MTA meta.xml script visibility.
     std::optional<std::string> buildMtaGlobalDeclarations(const Uri& uri) const;
 
+    /// Returns true if a global function is referenced by another visible MTA script in the same resource.
+    bool isMtaGlobalFunctionUsedOutsideFile(const Uri& uri, const std::string& functionName) const;
+
     // Plugin environment support
     bool isPluginFile(const Luau::ModuleName& name) const;
 };

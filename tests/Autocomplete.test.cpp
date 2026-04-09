@@ -265,6 +265,51 @@ TEST_CASE_FIXTURE(Fixture, "mta_meta_oop_class_globals_are_visible_with_public_i
     CHECK_FALSE(getItem(instanceResult, "private").has_value());
 }
 
+TEST_CASE_FIXTURE(Fixture, "mta_meta_global_functions_are_visible_by_script_type")
+{
+    switchToStandardPlatform();
+
+    tempDir.write_child("meta.xml", R"(
+        <meta>
+            <script src="server.luau" type="server" />
+            <script src="server2.luau" type="server" />
+        </meta>
+    )");
+
+    const std::string serverSource = R"(
+        function testGlobalFunction()
+            return true
+        end
+
+        function testGlobalFunc(app: string): string
+            return app
+        end
+
+        local function testLocalFunc(app: string): string
+            return app
+        end
+    )";
+
+    tempDir.write_child("server.luau", serverSource);
+    newDocument("server.luau", serverSource);
+
+    auto [source, marker] = sourceWithMarker("testGl|");
+    auto uri = newDocument("server2.luau", source);
+
+    lsp::CompletionParams params;
+    params.textDocument = lsp::TextDocumentIdentifier{uri};
+    params.position = marker;
+
+    auto result = workspace.completion(params, nullptr);
+    CHECK(getItem(result, "testGlobalFunction").has_value());
+    CHECK(getItem(result, "testGlobalFunc").has_value());
+    CHECK_FALSE(getItem(result, "testLocalFunc").has_value());
+
+    auto typedFuncItem = requireItem(result, "testGlobalFunc");
+    REQUIRE(typedFuncItem.detail.has_value());
+    CHECK_NE(typedFuncItem.detail->find("string"), std::string::npos);
+}
+
 TEST_CASE("merged_workspace_exports_completion_is_resource_scoped")
 {
     TempDir tempDir("luau_lsp_workspace_exports_completion");

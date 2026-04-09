@@ -126,6 +126,142 @@ static std::optional<std::string> sourceSliceFromLocation(const std::string& sou
     return source.substr(*start, *end - *start);
 }
 
+static std::string trimLeadingWhitespace(std::string value)
+{
+    size_t i = 0;
+    while (i < value.size() && std::isspace(static_cast<unsigned char>(value[i])))
+        ++i;
+
+    if (i == 0)
+        return value;
+
+    return value.substr(i);
+}
+
+static std::optional<std::string> normalizeFunctionExpressionSlice(std::string functionSlice)
+{
+    functionSlice = trimLeadingWhitespace(std::move(functionSlice));
+
+    if (functionSlice.rfind("function(", 0) == 0)
+        return functionSlice;
+
+    if (functionSlice.rfind("function ", 0) != 0)
+        return std::nullopt;
+
+    size_t openParen = functionSlice.find('(');
+    if (openParen == std::string::npos)
+        return std::nullopt;
+
+    return std::string("function") + functionSlice.substr(openParen);
+}
+
+static std::optional<std::string> astNameToString(const Luau::AstName& name);
+static bool isIdentifier(const std::string& value);
+
+static std::unordered_set<std::string> extractTopLevelGlobalFunctionNames(const std::string& source)
+{
+    std::unordered_set<std::string> names;
+
+    Luau::Allocator allocator;
+    Luau::AstNameTable nameTable{allocator};
+    Luau::ParseOptions options;
+    Luau::ParseResult parseResult = Luau::Parser::parse(source.c_str(), source.size(), nameTable, allocator, options);
+    if (!parseResult.root)
+        return names;
+
+    for (Luau::AstStat* stat : parseResult.root->body)
+    {
+        auto* fn = stat->as<Luau::AstStatFunction>();
+        if (!fn)
+            continue;
+
+        auto* global = fn->name->as<Luau::AstExprGlobal>();
+        if (!global)
+            continue;
+
+        if (auto name = astNameToString(global->name); name && isIdentifier(*name))
+            names.insert(*name);
+    }
+
+    return names;
+}
+
+struct GlobalNameReferenceCollector : Luau::AstVisitor
+{
+    const std::unordered_set<std::string>& tracked;
+    std::unordered_set<std::string> referenced;
+
+    explicit GlobalNameReferenceCollector(const std::unordered_set<std::string>& tracked)
+        : tracked(tracked)
+    {
+    }
+
+    bool visit(Luau::AstExprGlobal* global) override
+    {
+        if (auto name = astNameToString(global->name); name && tracked.count(*name))
+            referenced.insert(*name);
+
+        return true;
+    }
+
+    bool visit(Luau::AstStatFunction* fn) override
+    {
+        if (fn->func)
+            fn->func->visit(this);
+        return false;
+    }
+};
+
+static std::unordered_set<std::string> extractReferencedGlobalNames(
+    const std::string& source, const std::unordered_set<std::string>& trackedNames)
+{
+    std::unordered_set<std::string> referenced;
+
+    if (trackedNames.empty())
+        return referenced;
+
+    Luau::Allocator allocator;
+    Luau::AstNameTable nameTable{allocator};
+    Luau::ParseOptions options;
+    Luau::ParseResult parseResult = Luau::Parser::parse(source.c_str(), source.size(), nameTable, allocator, options);
+    if (!parseResult.root)
+        return referenced;
+
+    GlobalNameReferenceCollector collector{trackedNames};
+    parseResult.root->visit(&collector);
+    return std::move(collector.referenced);
+}
+
+static std::optional<std::string> buildUsedGlobalFunctionsPrelude(
+    const std::unordered_set<std::string>& definedFunctions, const std::unordered_set<std::string>& referencedFunctions)
+{
+    std::vector<std::string> usedFunctions;
+    usedFunctions.reserve(definedFunctions.size());
+    for (const auto& name : definedFunctions)
+    {
+        if (referencedFunctions.count(name))
+            usedFunctions.push_back(name);
+    }
+
+    if (usedFunctions.empty())
+        return std::nullopt;
+
+    std::sort(usedFunctions.begin(), usedFunctions.end());
+
+    std::string prelude;
+    prelude.reserve(usedFunctions.size() * 48);
+    prelude += "\n--!nolint\n";
+
+    for (size_t i = 0; i < usedFunctions.size(); ++i)
+    {
+        prelude += "if false then (";
+        prelude += usedFunctions[i];
+        prelude += " :: any)() end\n";
+    }
+
+    return prelude;
+}
+
 static Luau::Position endPosition(const std::string& source)
 {
     Luau::Position pos{0, 0};
@@ -507,7 +643,8 @@ static std::optional<std::string> extractTypedGlobalsPrelude(const std::string& 
             if (auto* global = fn->name->as<Luau::AstExprGlobal>())
             {
                 if (auto functionSlice = sourceSliceFromLocation(source, fn->func->location))
-                    globalTypeBodies.emplace_back(global->name.value, "return " + *functionSlice);
+                    if (auto normalizedFunction = normalizeFunctionExpressionSlice(*functionSlice))
+                        globalTypeBodies.emplace_back(global->name.value, "return " + *normalizedFunction);
             }
 
             if (auto methodInfo = classPublicMethodName(fn->name))
@@ -517,6 +654,10 @@ static std::optional<std::string> extractTypedGlobalsPrelude(const std::string& 
                 {
                     if (auto functionSlice = sourceSliceFromLocation(source, fn->func->location))
                     {
+                        auto normalizedFunction = normalizeFunctionExpressionSlice(*functionSlice);
+                        if (!normalizedFunction)
+                            continue;
+
                         auto& methods = oopPublicMethodsByGlobal[it->second];
                         bool methodExists = std::any_of(methods.begin(), methods.end(),
                             [&](const auto& pair)
@@ -525,7 +666,7 @@ static std::optional<std::string> extractTypedGlobalsPrelude(const std::string& 
                             });
 
                         if (!methodExists)
-                            methods.emplace_back(methodName, *functionSlice);
+                            methods.emplace_back(methodName, *normalizedFunction);
                     }
                 }
             }
@@ -853,8 +994,32 @@ std::optional<std::string> WorkspaceFileResolver::buildMtaGlobalDeclarations(con
     if (targetType == MTAScriptType::Unknown)
         return std::nullopt;
 
+    auto readSourceForUri = [&](const Uri& sourceUri) -> std::optional<std::string>
+    {
+        std::string sourcePath = normalizePath(sourceUri.fsPath());
+
+        if (auto* managed = getManagedTextDocument(sourceUri))
+            return managed->getText();
+
+        // Some clients may normalize file URIs differently (drive-letter casing, escaping).
+        // Fall back to matching managed documents by normalized file path.
+        for (const auto& [managedUri, managedDoc] : managedFiles)
+        {
+            if (normalizePath(managedUri.fsPath()) == sourcePath)
+                return managedDoc.getText();
+        }
+
+        return Luau::FileUtils::readFile(sourceUri.fsPath());
+    };
+
     std::unordered_set<std::string> seenFilePaths;
     std::string declarations;
+
+    std::unordered_set<std::string> targetGlobalFunctions;
+    if (auto targetSource = readSourceForUri(uri))
+        targetGlobalFunctions = extractTopLevelGlobalFunctionNames(*targetSource);
+
+    std::unordered_set<std::string> targetGlobalFunctionReferences;
 
     for (const auto& entry : scriptEntries)
     {
@@ -868,37 +1033,101 @@ std::optional<std::string> WorkspaceFileResolver::buildMtaGlobalDeclarations(con
         if (!seenFilePaths.insert(providerPath).second)
             continue;
 
-        std::optional<std::string> providerSource;
-        if (auto* managed = getManagedTextDocument(entry.uri))
-            providerSource = managed->getText();
-        else
-        {
-            // Some clients may normalize file URIs differently (drive-letter casing, escaping).
-            // Fall back to matching managed documents by normalized file path.
-            for (const auto& [managedUri, managedDoc] : managedFiles)
-            {
-                if (normalizePath(managedUri.fsPath()) == providerPath)
-                {
-                    providerSource = managedDoc.getText();
-                    break;
-                }
-            }
-
-            if (!providerSource)
-                providerSource = Luau::FileUtils::readFile(entry.uri.fsPath());
-        }
+        auto providerSource = readSourceForUri(entry.uri);
 
         if (!providerSource)
             continue;
 
         if (auto prelude = extractTypedGlobalsPrelude(*providerSource))
             declarations += *prelude;
+
+        if (!targetGlobalFunctions.empty())
+        {
+            auto references = extractReferencedGlobalNames(*providerSource, targetGlobalFunctions);
+            targetGlobalFunctionReferences.insert(references.begin(), references.end());
+        }
     }
+
+    if (auto usedGlobalsPrelude = buildUsedGlobalFunctionsPrelude(targetGlobalFunctions, targetGlobalFunctionReferences))
+        declarations += *usedGlobalsPrelude;
 
     if (declarations.empty())
         return std::nullopt;
 
     return declarations;
+}
+
+bool WorkspaceFileResolver::isMtaGlobalFunctionUsedOutsideFile(const Uri& uri, const std::string& functionName) const
+{
+    if (!isIdentifier(functionName))
+        return false;
+
+    auto metaUri = findResourceMetaFile(uri);
+    if (!metaUri)
+        return false;
+
+    auto metaSource = Luau::FileUtils::readFile(metaUri->fsPath());
+    if (!metaSource)
+        return false;
+
+    auto scriptEntries = parseMtaScriptEntries(*metaUri, *metaSource);
+    if (scriptEntries.empty())
+        return false;
+
+    const auto targetPath = normalizePath(uri.fsPath());
+    MTAScriptType targetType = MTAScriptType::Unknown;
+    for (const auto& entry : scriptEntries)
+    {
+        if (normalizePath(entry.uri.fsPath()) == targetPath)
+        {
+            targetType = entry.type;
+            break;
+        }
+    }
+
+    if (targetType == MTAScriptType::Unknown)
+        return false;
+
+    auto readSourceForUri = [&](const Uri& sourceUri) -> std::optional<std::string>
+    {
+        std::string sourcePath = normalizePath(sourceUri.fsPath());
+
+        if (auto* managed = getManagedTextDocument(sourceUri))
+            return managed->getText();
+
+        for (const auto& [managedUri, managedDoc] : managedFiles)
+        {
+            if (normalizePath(managedUri.fsPath()) == sourcePath)
+                return managedDoc.getText();
+        }
+
+        return Luau::FileUtils::readFile(sourceUri.fsPath());
+    };
+
+    std::unordered_set<std::string> tracked{functionName};
+    std::unordered_set<std::string> seenFilePaths;
+    for (const auto& entry : scriptEntries)
+    {
+        if (!canSeeScriptType(targetType, entry.type))
+            continue;
+
+        std::string providerPath = normalizePath(entry.uri.fsPath());
+        if (providerPath == targetPath)
+            continue;
+
+        if (!seenFilePaths.insert(providerPath).second)
+            continue;
+
+        auto providerSource = readSourceForUri(entry.uri);
+        if (!providerSource)
+            continue;
+
+        auto references = extractReferencedGlobalNames(*providerSource, tracked);
+        if (references.count(functionName))
+            return true;
+    }
+
+    return false;
 }
 
 const TextDocument* WorkspaceFileResolver::getTextDocumentFromModuleName(const Luau::ModuleName& name) const

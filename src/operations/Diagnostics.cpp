@@ -17,6 +17,20 @@ static bool supportsRelatedDocuments(const lsp::ClientCapabilities& capabilities
     return capabilities.textDocument && capabilities.textDocument->diagnostic && capabilities.textDocument->diagnostic->relatedDocumentSupport;
 }
 
+static std::optional<std::string> extractUnusedFunctionName(const std::string& message)
+{
+    static const std::string prefix = "FunctionUnused: Function '";
+    if (message.rfind(prefix, 0) != 0)
+        return std::nullopt;
+
+    size_t start = prefix.size();
+    size_t end = message.find("' is never used", start);
+    if (end == std::string::npos || end <= start)
+        return std::nullopt;
+
+    return message.substr(start, end - start);
+}
+
 /// Compute a document diagnostics report for a single file (and potentially related files)
 /// By default, this is called by the client for an open document. Hence we can expect that files are managed
 /// However, we sometimes call this as part of reverse-dependency updates (see updateTextDocument), where the file may be unmanaged
@@ -106,7 +120,17 @@ lsp::DocumentDiagnosticReport WorkspaceFolder::documentDiagnostics(
         report.items.emplace_back(diagnostic);
     }
     for (auto& error : cr.lintResult.warnings)
-        report.items.emplace_back(createLintDiagnostic(error, *textDocument));
+    {
+        auto diagnostic = createLintDiagnostic(error, *textDocument);
+
+        if (auto functionName = extractUnusedFunctionName(diagnostic.message))
+        {
+            if (fileResolver.isMtaGlobalFunctionUsedOutsideFile(params.textDocument.uri, *functionName))
+                continue;
+        }
+
+        report.items.emplace_back(std::move(diagnostic));
+    }
 
     return report;
 }
@@ -199,7 +223,17 @@ lsp::WorkspaceDiagnosticReport WorkspaceFolder::workspaceDiagnostics(const lsp::
             documentReport.items.emplace_back(diagnostic);
         }
         for (auto& error : cr.lintResult.warnings)
-            documentReport.items.emplace_back(createLintDiagnostic(error, document));
+        {
+            auto diagnostic = createLintDiagnostic(error, document);
+
+            if (auto functionName = extractUnusedFunctionName(diagnostic.message))
+            {
+                if (fileResolver.isMtaGlobalFunctionUsedOutsideFile(uri, *functionName))
+                    continue;
+            }
+
+            documentReport.items.emplace_back(std::move(diagnostic));
+        }
 
         workspaceReport.items.emplace_back(documentReport);
     }
