@@ -1,3 +1,4 @@
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -26,6 +27,237 @@ static Luau::AstNode* getParentNode(const std::vector<Luau::AstNode*> ancestry)
         return *it;
     }
     return nullptr;
+}
+
+struct MetatableMethodScope
+{
+    std::string className;
+    Luau::Location location;
+};
+
+struct MetatableCompletionInfo
+{
+    std::unordered_set<std::string> classNames;
+    std::unordered_map<std::string, std::unordered_set<std::string>> methodsByClass;
+    std::vector<MetatableMethodScope> methodScopes;
+};
+
+static std::optional<std::string> astNameToString(const Luau::AstName& name)
+{
+    if (!name.value)
+        return std::nullopt;
+
+    return std::string(name.value);
+}
+
+static std::optional<std::string> getSimpleExprName(const Luau::AstExpr* expr)
+{
+    if (const auto* local = expr->as<Luau::AstExprLocal>())
+        return astNameToString(local->local->name);
+    if (const auto* global = expr->as<Luau::AstExprGlobal>())
+        return astNameToString(global->name);
+
+    return std::nullopt;
+}
+
+static bool isOopCreateLikeCall(const Luau::AstExpr* expr)
+{
+    const auto* call = expr->as<Luau::AstExprCall>();
+    if (!call || !call->self)
+        return false;
+
+    const auto* indexName = call->func->as<Luau::AstExprIndexName>();
+    if (!indexName)
+        return false;
+
+    auto memberName = astNameToString(indexName->index);
+    if (!memberName)
+        return false;
+
+    if (*memberName != "create" && *memberName != "define" && *memberName != "extend")
+        return false;
+
+    if (auto ownerName = getSimpleExprName(indexName->expr))
+        return *ownerName == "oop";
+
+    return false;
+}
+
+struct PublicMethodName
+{
+    std::string className;
+    std::string methodName;
+    Luau::Location location;
+};
+
+static std::optional<PublicMethodName> extractPublicMethodName(const Luau::AstExpr* expr, const Luau::Location& functionLocation)
+{
+    const auto* methodExpr = expr->as<Luau::AstExprIndexName>();
+    if (!methodExpr)
+        return std::nullopt;
+
+    const auto* publicExpr = methodExpr->expr->as<Luau::AstExprIndexName>();
+    if (!publicExpr || publicExpr->op != '.')
+        return std::nullopt;
+
+    auto publicName = astNameToString(publicExpr->index);
+    if (!publicName || *publicName != "public")
+        return std::nullopt;
+
+    auto className = getSimpleExprName(publicExpr->expr);
+    if (!className)
+        return std::nullopt;
+
+    auto methodName = astNameToString(methodExpr->index);
+    if (!methodName)
+        return std::nullopt;
+
+    return PublicMethodName{*className, *methodName, functionLocation};
+}
+
+struct MetatableClassCollector : Luau::AstVisitor
+{
+    MetatableCompletionInfo info;
+
+    bool visit(Luau::AstStatLocal* local) override
+    {
+        const size_t count = std::min(local->vars.size, local->values.size);
+        for (size_t i = 0; i < count; ++i)
+        {
+            if (isOopCreateLikeCall(local->values.data[i]))
+                if (auto name = astNameToString(local->vars.data[i]->name))
+                    info.classNames.emplace(*name);
+        }
+
+        return true;
+    }
+
+    bool visit(Luau::AstStatAssign* assign) override
+    {
+        const size_t count = std::min(assign->vars.size, assign->values.size);
+        for (size_t i = 0; i < count; ++i)
+        {
+            if (!isOopCreateLikeCall(assign->values.data[i]))
+                continue;
+
+            if (const auto* local = assign->vars.data[i]->as<Luau::AstExprLocal>())
+            {
+                if (auto name = astNameToString(local->local->name))
+                    info.classNames.emplace(*name);
+            }
+            else if (const auto* global = assign->vars.data[i]->as<Luau::AstExprGlobal>())
+            {
+                if (auto name = astNameToString(global->name))
+                    info.classNames.emplace(*name);
+            }
+        }
+
+        return true;
+    }
+
+    bool visit(Luau::AstStatFunction* function) override
+    {
+        if (auto method = extractPublicMethodName(function->name, function->func->body->location))
+        {
+            info.methodsByClass[method->className].emplace(method->methodName);
+            info.methodScopes.push_back(MetatableMethodScope{method->className, method->location});
+        }
+
+        return true;
+    }
+};
+
+static std::optional<std::string> getClassNameForPublicExpr(const Luau::AstExpr* expr)
+{
+    const auto* publicExpr = expr->as<Luau::AstExprIndexName>();
+    if (!publicExpr || publicExpr->op != '.')
+        return std::nullopt;
+
+    auto publicName = astNameToString(publicExpr->index);
+    if (!publicName || *publicName != "public")
+        return std::nullopt;
+
+    return getSimpleExprName(publicExpr->expr);
+}
+
+static std::optional<std::string> getEnclosingMethodClass(const MetatableCompletionInfo& info, const Luau::Position& position)
+{
+    std::optional<MetatableMethodScope> bestScope;
+
+    for (const auto& scope : info.methodScopes)
+    {
+        if (!scope.location.containsClosed(position))
+            continue;
+
+        if (!bestScope || bestScope->location.encloses(scope.location))
+            bestScope = scope;
+    }
+
+    if (!bestScope)
+        return std::nullopt;
+
+    return bestScope->className;
+}
+
+static void addCustomCompletionItem(std::vector<lsp::CompletionItem>& items, std::unordered_set<std::string>& labels, const std::string& label,
+    lsp::CompletionItemKind kind, const std::string& detail)
+{
+    if (!labels.insert(label).second)
+        return;
+
+    lsp::CompletionItem item;
+    item.label = label;
+    item.kind = kind;
+    item.detail = detail;
+    items.push_back(std::move(item));
+}
+
+static void addMetatableCompletions(const Luau::AutocompleteResult& result, const Luau::Position& position, std::vector<lsp::CompletionItem>& items,
+    const MetatableCompletionInfo& info)
+{
+    if (result.context != Luau::AutocompleteContext::Property || result.ancestry.empty())
+        return;
+
+    auto* currentExpr = result.ancestry.back()->asExpr();
+    const auto* indexName = currentExpr ? currentExpr->as<Luau::AstExprIndexName>() : nullptr;
+    if (!indexName)
+        return;
+
+    std::unordered_set<std::string> existingLabels;
+    existingLabels.reserve(items.size());
+    for (const auto& item : items)
+        existingLabels.insert(item.label);
+
+    if (auto className = getSimpleExprName(indexName->expr); className && info.classNames.count(*className))
+    {
+        addCustomCompletionItem(items, existingLabels, "public", lsp::CompletionItemKind::Field, "metatable class member");
+        addCustomCompletionItem(items, existingLabels, "private", lsp::CompletionItemKind::Field, "metatable class member");
+        addCustomCompletionItem(items, existingLabels, "protected", lsp::CompletionItemKind::Field, "metatable class member");
+        return;
+    }
+
+    if (auto className = getClassNameForPublicExpr(indexName->expr); className)
+    {
+        if (auto it = info.methodsByClass.find(*className); it != info.methodsByClass.end())
+        {
+            for (const auto& methodName : it->second)
+                addCustomCompletionItem(items, existingLabels, methodName, lsp::CompletionItemKind::Method, "metatable public method");
+            return;
+        }
+    }
+
+    if (auto receiverName = getSimpleExprName(indexName->expr); receiverName && *receiverName == "self")
+    {
+        auto className = getEnclosingMethodClass(info, position);
+        if (!className)
+            return;
+
+        if (auto it = info.methodsByClass.find(*className); it != info.methodsByClass.end())
+        {
+            for (const auto& methodName : it->second)
+                addCustomCompletionItem(items, existingLabels, methodName, lsp::CompletionItemKind::Method, "metatable public method");
+        }
+    }
 }
 
 void WorkspaceFolder::endAutocompletion(const lsp::CompletionParams& params)
@@ -794,6 +1026,13 @@ std::vector<lsp::CompletionItem> WorkspaceFolder::completion(const lsp::Completi
 
     if (auto module = frontend.getSourceModule(moduleName))
         platform->handleCompletion(*textDocument, *module, position, items);
+
+    if (auto sourceModule = frontend.getSourceModule(moduleName))
+    {
+        MetatableClassCollector collector;
+        sourceModule->root->visit(&collector);
+        addMetatableCompletions(result, position, items, collector.info);
+    }
 
     if (config.completion.suggestImports || config.completion.imports.enabled)
     {

@@ -239,7 +239,7 @@
             "roblox"
           ],
           "scope": "window",
-          "default": "roblox"
+          "default": "standard"
         },
         "luau-lsp.sourcemap.enabled": {
           "markdownDescription": "Whether Rojo sourcemap parsing is enabled",

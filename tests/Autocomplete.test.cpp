@@ -262,6 +262,99 @@ TEST_CASE("merged_workspace_exports_completion_is_resource_scoped")
     CHECK_FALSE(getItem(testBResult, "funcao").has_value());
 }
 
+TEST_CASE_FIXTURE(Fixture, "metatable_oop_completions_for_class_public_and_self")
+{
+    switchToStandardPlatform();
+
+    auto [classSource, classMarker] = sourceWithMarker(R"(
+        local oop = {}
+        function oop:create(...)
+            return {}
+        end
+
+        local app = oop:create("ola", nil, nil, true)
+
+        function app.public:getBark()
+            return "woof"
+        end
+
+        function app.public:load()
+            self:getBark()
+            self.health = 100
+        end
+
+        app.|
+    )");
+
+    auto uri = newDocument("metatable_oop.luau", classSource);
+
+    lsp::CompletionParams classParams;
+    classParams.textDocument = lsp::TextDocumentIdentifier{uri};
+    classParams.position = classMarker;
+
+    auto classResult = workspace.completion(classParams, nullptr);
+    CHECK(getItem(classResult, "public").has_value());
+    CHECK(getItem(classResult, "private").has_value());
+    CHECK(getItem(classResult, "protected").has_value());
+
+    auto [publicSource, publicMarker] = sourceWithMarker(R"(
+        local oop = {}
+        function oop:create(...)
+            return {}
+        end
+
+        local app = oop:create("ola", nil, nil, true)
+
+        function app.public:getBark()
+            return "woof"
+        end
+
+        function app.public:load()
+            self:getBark()
+            self.health = 100
+        end
+
+        app.public:|
+    )");
+
+    updateDocument(uri, publicSource);
+
+    lsp::CompletionParams publicParams;
+    publicParams.textDocument = lsp::TextDocumentIdentifier{uri};
+    publicParams.position = publicMarker;
+
+    auto publicResult = workspace.completion(publicParams, nullptr);
+    CHECK(getItem(publicResult, "getBark").has_value());
+    CHECK(getItem(publicResult, "load").has_value());
+
+    auto [selfSource, selfMarker] = sourceWithMarker(R"(
+        local oop = {}
+        function oop:create(...)
+            return {}
+        end
+
+        local app = oop:create("ola", nil, nil, true)
+
+        function app.public:getBark()
+            return "woof"
+        end
+
+        function app.public:load()
+            self.|
+        end
+    )");
+
+    updateDocument(uri, selfSource);
+
+    lsp::CompletionParams selfParams;
+    selfParams.textDocument = lsp::TextDocumentIdentifier{uri};
+    selfParams.position = selfMarker;
+
+    auto selfResult = workspace.completion(selfParams, nullptr);
+    CHECK(getItem(selfResult, "getBark").has_value());
+    CHECK(getItem(selfResult, "load").has_value());
+}
+
 TEST_CASE_FIXTURE(Fixture, "function_autocomplete_has_documentation")
 {
     auto [source, marker] = sourceWithMarker(R"(
