@@ -86,6 +86,17 @@ TEST_CASE_FIXTURE(Fixture, "text_document_update_marks_dependent_files_as_dirty"
     CHECK_EQ(diagnosticsB.items[0].message, "TypeError: Key 'hello' not found in table '{ hello2: boolean }'");
 }
 
+TEST_CASE_FIXTURE(Fixture, "lua_files_do_not_run_typecheck_or_lint")
+{
+    auto document = newDocument("main.lua", R"(
+        --!strict
+        local x: string = 1
+    )");
+
+    auto diagnostics = workspace.documentDiagnostics(lsp::DocumentDiagnosticParams{{document}}, nullptr);
+    CHECK_EQ(diagnostics.items.size(), 0);
+}
+
 TEST_CASE_FIXTURE(Fixture, "text_document_update_triggers_dependent_diagnostics_in_push_based_diagnostics")
 {
     client->globalConfig.diagnostics.includeDependents = true;

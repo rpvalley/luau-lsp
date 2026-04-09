@@ -3,6 +3,7 @@
 #include "Platform/RobloxPlatform.hpp"
 #include "LuauFileUtils.hpp"
 #include "Luau/Parser.h"
+#include "TempDir.h"
 
 using namespace Luau::LanguageServer;
 
@@ -141,6 +142,69 @@ TEST_CASE("package_name_is_recorded_onto_the_loaded_types")
     auto ctv = Luau::get<Luau::ExternType>(ty);
     REQUIRE(ctv);
     CHECK_EQ(ctv->definitionModuleName, "@example");
+}
+
+TEST_CASE("auto_discovers_workspace_d_lua_definition_files")
+{
+    TempDir tempDir("luau_lsp_workspace_definitions");
+    tempDir.write_child("types/mta.d.lua", R"(
+        declare ScannedGlobal: { id: number }
+    )");
+
+    TestClient client;
+    auto workspace = WorkspaceFolder(&client, "$TEST_WORKSPACE", Uri::file(tempDir.path()), std::nullopt);
+
+    auto config = defaultTestClientConfiguration();
+    config.platform.type = LSPPlatformConfig::Standard;
+
+    workspace.setupWithConfiguration(config);
+    workspace.isReady = true;
+
+    auto document = newDocument(workspace, "main.luau", R"(
+        --!strict
+        local id: number = ScannedGlobal.id
+    )");
+
+    auto result = workspace.frontend.check(workspace.fileResolver.getModuleName(document));
+    REQUIRE(result.errors.empty());
+}
+
+TEST_CASE("merges_exports_declarations_from_multiple_d_lua_files")
+{
+    TempDir tempDir("luau_lsp_workspace_exports_merge");
+    tempDir.write_child("types/inventory.d.lua", R"(
+        declare exports: {
+            ['valley_inventory']: {
+                funcao: (self: any, s: string) -> number
+            }
+        }
+    )");
+    tempDir.write_child("types/test_b.d.lua", R"(
+        declare exports: {
+            ['valley_test_b']: {
+                makeApi: (self: any, s: string) -> number
+            }
+        }
+    )");
+
+    TestClient client;
+    auto workspace = WorkspaceFolder(&client, "$TEST_WORKSPACE", Uri::file(tempDir.path()), std::nullopt);
+
+    auto config = defaultTestClientConfiguration();
+    config.platform.type = LSPPlatformConfig::Standard;
+
+    workspace.setupWithConfiguration(config);
+    workspace.isReady = true;
+
+    auto document = newDocument(workspace, "main.luau", R"(
+        --!strict
+        local a: number = exports['valley_inventory']:funcao("abc")
+        local b: number = exports['valley_test_b']:makeApi("abc")
+        local c: number = exports['valley_inventory']:makeApi("abc")
+    )");
+
+    auto result = workspace.frontend.check(workspace.fileResolver.getModuleName(document));
+    REQUIRE_EQ(result.errors.size(), 1);
 }
 
 TEST_CASE("support_disabling_methods_in_extern_types_globals")

@@ -5,6 +5,7 @@
 #include "LSP/IostreamHelpers.hpp"
 #include "LSP/Completion.hpp"
 #include "Platform/InstanceRequireAutoImporter.hpp"
+#include "TempDir.h"
 
 std::optional<lsp::CompletionItem> getItem(const std::vector<lsp::CompletionItem>& items, const std::string& label)
 {
@@ -190,6 +191,75 @@ TEST_CASE_FIXTURE(Fixture, "mta_meta_client_globals_are_not_visible_to_server_co
 
     auto serverResult = workspace.completion(serverParams, nullptr);
     CHECK_FALSE(getItem(serverResult, "CLIENT_ONLY").has_value());
+}
+
+TEST_CASE("merged_workspace_exports_completion_is_resource_scoped")
+{
+    TempDir tempDir("luau_lsp_workspace_exports_completion");
+
+    tempDir.write_child("types/inventory.d.lua", R"(
+        declare exports: {
+            ['valley_inventory']: {
+                funcao: (self: any, s: string) -> number
+            }
+        }
+    )");
+    tempDir.write_child("types/test_b.d.lua", R"(
+        declare exports: {
+            ['valley_test_b']: {
+                makeApi: (self: any, s: string) -> number
+            }
+        }
+    )");
+
+    TestClient client;
+    auto workspace = WorkspaceFolder(&client, "$TEST_WORKSPACE", Uri::file(tempDir.path()), std::nullopt);
+
+    auto config = Luau::LanguageServer::defaultTestClientConfiguration();
+    config.platform.type = LSPPlatformConfig::Standard;
+
+    workspace.setupWithConfiguration(config);
+    workspace.isReady = true;
+
+    auto [topLevelSource, topLevelMarker] = sourceWithMarker("exp|");
+    auto uri = Luau::LanguageServer::newDocument(workspace, "main.luau", topLevelSource);
+
+    auto updateSource = [&](const std::string& source)
+    {
+        lsp::DidChangeTextDocumentParams params;
+        params.textDocument = {{uri}, 0};
+        params.contentChanges = {{std::nullopt, source}};
+        workspace.updateTextDocument(uri, params);
+    };
+
+    lsp::CompletionParams topLevelParams;
+    topLevelParams.textDocument = lsp::TextDocumentIdentifier{uri};
+    topLevelParams.position = topLevelMarker;
+
+    auto topLevelResult = workspace.completion(topLevelParams, nullptr);
+    CHECK(getItem(topLevelResult, "exports").has_value());
+
+    auto [inventorySource, inventoryMarker] = sourceWithMarker("exports['valley_inventory']:|");
+    updateSource(inventorySource);
+
+    lsp::CompletionParams inventoryParams;
+    inventoryParams.textDocument = lsp::TextDocumentIdentifier{uri};
+    inventoryParams.position = inventoryMarker;
+
+    auto inventoryResult = workspace.completion(inventoryParams, nullptr);
+    CHECK(getItem(inventoryResult, "funcao").has_value());
+    CHECK_FALSE(getItem(inventoryResult, "makeApi").has_value());
+
+    auto [testBSource, testBMarker] = sourceWithMarker("exports['valley_test_b']:|");
+    updateSource(testBSource);
+
+    lsp::CompletionParams testBParams;
+    testBParams.textDocument = lsp::TextDocumentIdentifier{uri};
+    testBParams.position = testBMarker;
+
+    auto testBResult = workspace.completion(testBParams, nullptr);
+    CHECK(getItem(testBResult, "makeApi").has_value());
+    CHECK_FALSE(getItem(testBResult, "funcao").has_value());
 }
 
 TEST_CASE_FIXTURE(Fixture, "function_autocomplete_has_documentation")

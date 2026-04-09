@@ -1,6 +1,10 @@
 #include "LSP/Workspace.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <memory>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "LSP/Diagnostics.hpp"
 #include "Platform/LSPPlatform.hpp"
@@ -19,6 +23,244 @@ void throwIfCancelled(const LSPCancellationToken& cancellationToken)
 {
     if (cancellationToken && cancellationToken->requested())
         throw RequestCancelledException();
+}
+
+static bool shouldTypecheckModule(const WorkspaceFileResolver& fileResolver, const Luau::ModuleName& moduleName)
+{
+    return fileResolver.getUri(moduleName).extension() != ".lua";
+}
+
+static bool hasLuaDefinitionSuffix(const std::string& path)
+{
+    constexpr const char* kSuffix = ".d.lua";
+    constexpr size_t kSuffixLen = 6;
+
+    if (path.size() < kSuffixLen)
+        return false;
+
+    return path.compare(path.size() - kSuffixLen, kSuffixLen, kSuffix) == 0;
+}
+
+static std::string normalizeDefinitionPathForKey(const std::string& path)
+{
+    std::string normalized = Luau::FileUtils::normalizePath(path);
+#ifdef _WIN32
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+        [](unsigned char c)
+        {
+            return static_cast<char>(std::tolower(c));
+        });
+#endif
+    return normalized;
+}
+
+static std::vector<std::pair<std::string, std::string>> discoverWorkspaceDefinitionFiles(const Uri& rootUri)
+{
+    std::vector<std::pair<std::string, std::string>> result;
+
+    if (rootUri.scheme != "file" || !rootUri.exists() || !rootUri.isDirectory())
+        return result;
+
+    const std::string rootPath = rootUri.fsPath();
+    Luau::FileUtils::traverseDirectoryRecursive(rootPath,
+        [&](const std::string& path)
+        {
+            if (!hasLuaDefinitionSuffix(path))
+                return;
+
+            const Uri fileUri = Uri::file(path);
+            std::string relativePath = fileUri.lexicallyRelative(rootUri);
+            if (relativePath.empty())
+                relativePath = fileUri.filename();
+
+            std::replace(relativePath.begin(), relativePath.end(), '\\', '/');
+            result.emplace_back("@workspace/" + relativePath, path);
+        });
+
+    return result;
+}
+
+static std::string trimWhitespace(std::string value)
+{
+    auto isWs = [](unsigned char c)
+    {
+        return std::isspace(c) != 0;
+    };
+
+    while (!value.empty() && isWs(static_cast<unsigned char>(value.front())))
+        value.erase(value.begin());
+    while (!value.empty() && isWs(static_cast<unsigned char>(value.back())))
+        value.pop_back();
+
+    return value;
+}
+
+struct ExportsDeclarationExtraction
+{
+    std::string transformedSource;
+    std::vector<std::string> entries;
+};
+
+static ExportsDeclarationExtraction extractExportsDeclarations(const std::string& source)
+{
+    constexpr std::string_view kDeclarationPrefix = "declare exports:";
+
+    ExportsDeclarationExtraction extraction;
+    extraction.transformedSource.reserve(source.size());
+
+    size_t cursor = 0;
+    while (cursor < source.size())
+    {
+        size_t declarationStart = source.find(kDeclarationPrefix, cursor);
+        if (declarationStart == std::string::npos)
+            break;
+
+        size_t blockStart = declarationStart + kDeclarationPrefix.size();
+        while (blockStart < source.size() && std::isspace(static_cast<unsigned char>(source[blockStart])))
+            blockStart++;
+
+        if (blockStart >= source.size() || source[blockStart] != '{')
+        {
+            extraction.transformedSource.append(source.substr(cursor, declarationStart + 1 - cursor));
+            cursor = declarationStart + 1;
+            continue;
+        }
+
+        size_t blockEnd = blockStart;
+        int braceDepth = 0;
+        bool inString = false;
+        char quote = '\0';
+        bool escaped = false;
+
+        for (; blockEnd < source.size(); blockEnd++)
+        {
+            char c = source[blockEnd];
+
+            if (inString)
+            {
+                if (escaped)
+                    escaped = false;
+                else if (c == '\\')
+                    escaped = true;
+                else if (c == quote)
+                    inString = false;
+
+                continue;
+            }
+
+            if (c == '"' || c == '\'')
+            {
+                inString = true;
+                quote = c;
+                continue;
+            }
+
+            if (c == '{')
+                braceDepth++;
+            else if (c == '}')
+            {
+                braceDepth--;
+                if (braceDepth == 0)
+                    break;
+            }
+        }
+
+        if (blockEnd >= source.size() || braceDepth != 0)
+        {
+            extraction.transformedSource.append(source.substr(cursor, declarationStart + 1 - cursor));
+            cursor = declarationStart + 1;
+            continue;
+        }
+
+        extraction.transformedSource.append(source.substr(cursor, declarationStart - cursor));
+        extraction.transformedSource += "\n";
+
+        std::string inner = source.substr(blockStart + 1, blockEnd - blockStart - 1);
+        inner = trimWhitespace(std::move(inner));
+        if (!inner.empty())
+            extraction.entries.push_back(std::move(inner));
+
+        cursor = blockEnd + 1;
+    }
+
+    extraction.transformedSource += source.substr(cursor);
+    return extraction;
+}
+
+static std::optional<std::string> extractExportsResourceName(const std::string& entry)
+{
+    size_t i = 0;
+    while (i < entry.size() && std::isspace(static_cast<unsigned char>(entry[i])))
+        i++;
+
+    if (i >= entry.size() || entry[i] != '[')
+        return std::nullopt;
+
+    i++;
+    while (i < entry.size() && std::isspace(static_cast<unsigned char>(entry[i])))
+        i++;
+
+    if (i >= entry.size() || (entry[i] != '\'' && entry[i] != '"'))
+        return std::nullopt;
+
+    const char quote = entry[i++];
+    std::string key;
+    while (i < entry.size())
+    {
+        const char c = entry[i++];
+        if (c == quote)
+            return key;
+
+        if (c == '\\' && i < entry.size())
+            key += entry[i++];
+        else
+            key += c;
+    }
+
+    return std::nullopt;
+}
+
+static std::string stripTrailingComma(std::string value)
+{
+    value = trimWhitespace(std::move(value));
+    if (!value.empty() && value.back() == ',')
+        value.pop_back();
+    return trimWhitespace(std::move(value));
+}
+
+static std::optional<std::string> buildMergedExportsDefinition(const std::vector<std::string>& entries)
+{
+    if (entries.empty())
+        return std::nullopt;
+
+    std::unordered_map<std::string, std::string> keyedEntries;
+    std::vector<std::string> keyedOrder;
+    std::vector<std::string> anonymousEntries;
+
+    for (const auto& entry : entries)
+    {
+        auto cleanedEntry = stripTrailingComma(entry);
+        if (cleanedEntry.empty())
+            continue;
+
+        if (auto key = extractExportsResourceName(cleanedEntry))
+        {
+            if (!keyedEntries.count(*key))
+                keyedOrder.push_back(*key);
+            keyedEntries[*key] = std::move(cleanedEntry);
+        }
+        else
+            anonymousEntries.push_back(std::move(cleanedEntry));
+    }
+
+    std::string merged = "declare exports: {\n";
+    for (const auto& key : keyedOrder)
+        merged += "    " + keyedEntries.at(key) + ",\n";
+    for (const auto& entry : anonymousEntries)
+        merged += "    " + entry + ",\n";
+    merged += "}\n";
+
+    return merged;
 }
 
 const Luau::ModulePtr WorkspaceFolder::getModule(const Luau::ModuleName& moduleName, bool forAutocomplete) const
@@ -329,6 +571,12 @@ Luau::CheckResult WorkspaceFolder::checkSimple(const Luau::ModuleName& moduleNam
 {
     try
     {
+        if (!shouldTypecheckModule(fileResolver, moduleName))
+        {
+            frontend.parse(moduleName);
+            return {};
+        }
+
         Luau::FrontendOptions options{/* retainFullTypeGraphs: */ false, /* forAutocomplete: */ false, /* runLintChecks: */ true};
         options.cancellationToken = cancellationToken;
         return frontend.check(moduleName, options);
@@ -350,6 +598,12 @@ Luau::CheckResult WorkspaceFolder::checkSimple(const Luau::ModuleName& moduleNam
 Luau::CheckResult WorkspaceFolder::checkStrict(
     const Luau::ModuleName& moduleName, const LSPCancellationToken& cancellationToken, bool forAutocomplete)
 {
+    if (!shouldTypecheckModule(fileResolver, moduleName))
+    {
+        frontend.parse(moduleName);
+        return {};
+    }
+
     if (FFlag::LuauSolverV2)
         forAutocomplete = false;
 
@@ -558,19 +812,37 @@ void WorkspaceFolder::registerTypes(const std::vector<std::string>& disabledGlob
     frontend.applyBuiltinDefinitionToEnvironment("LSPPlugin", "LSPPlugin");
     client->sendTrace("workspace initialization: registering LSPPlugin environment COMPLETED");
 
-    if (client->definitionsFiles.empty())
-        client->sendLogMessage(lsp::MessageType::Warning, "No definitions file provided by client");
-
     // For backwards compatibility, we need to keep an ordering where a definitions file for '@roblox' is always processed first
     std::vector<std::pair<std::string, std::string>> definitionsFilesToProcess{};
     definitionsFilesToProcess.reserve(client->definitionsFiles.size());
+    std::unordered_set<std::string> definitionPaths{};
+
+    auto tryAddDefinition =
+        [&](const std::string& packageName, const std::string& definitionsFile)
+        {
+            auto normalizedPath = normalizeDefinitionPathForKey(resolvePath(definitionsFile));
+            if (definitionPaths.insert(normalizedPath).second)
+                definitionsFilesToProcess.emplace_back(packageName, definitionsFile);
+        };
+
     if (auto it = client->definitionsFiles.find("@roblox"); it != client->definitionsFiles.end())
-        definitionsFilesToProcess.emplace_back(*it);
+        tryAddDefinition(it->first, it->second);
+
     for (const auto& pair : client->definitionsFiles)
     {
         if (pair.first != "@roblox")
-            definitionsFilesToProcess.emplace_back(pair);
+            tryAddDefinition(pair.first, pair.second);
     }
+
+    auto workspaceDefinitions = discoverWorkspaceDefinitionFiles(rootUri);
+    definitionsFilesToProcess.reserve(definitionsFilesToProcess.size() + workspaceDefinitions.size());
+    for (const auto& [packageName, definitionsFile] : workspaceDefinitions)
+        tryAddDefinition(packageName, definitionsFile);
+
+    if (definitionsFilesToProcess.empty())
+        client->sendLogMessage(lsp::MessageType::Warning, "No definitions file provided by client or found in workspace (*.d.lua)");
+
+    std::vector<std::string> exportsEntriesToMerge;
 
     for (const auto& [packageName, definitionsFile] : definitionsFilesToProcess)
     {
@@ -592,8 +864,18 @@ void WorkspaceFolder::registerTypes(const std::vector<std::string>& disabledGlob
             definitionsFileMetadata = metadata;
         client->sendTrace("workspace initialization: parsing definitions file metadata COMPLETED", json(definitionsFileMetadata).dump());
 
+        auto extraction = extractExportsDeclarations(*definitionsContents);
+        exportsEntriesToMerge.insert(exportsEntriesToMerge.end(), extraction.entries.begin(), extraction.entries.end());
+
+        std::string sourceForRegistration = std::move(extraction.transformedSource);
+        if (trimWhitespace(sourceForRegistration).empty())
+        {
+            client->publishDiagnostics({Uri::file(resolvedFilePath), std::nullopt, {}});
+            continue;
+        }
+
         client->sendTrace("workspace initialization: registering types definition");
-        auto result = loadDefinitionFile(packageName, *definitionsContents, metadata);
+        auto result = loadDefinitionFile(packageName, sourceForRegistration, metadata);
         client->sendTrace("workspace initialization: registering types definition COMPLETED");
 
         auto uri = Uri::file(resolvedFilePath);
@@ -605,7 +887,7 @@ void WorkspaceFolder::registerTypes(const std::vector<std::string>& disabledGlob
 
             // Update the text document URI to point to the actual file on disk
             if (auto it = definitionsFileState.find(packageName); it != definitionsFileState.end())
-                it->second.textDocument = TextDocument(uri, "luau", 0, *definitionsContents);
+                it->second.textDocument = TextDocument(uri, "luau", 0, sourceForRegistration);
         }
         else
         {
@@ -623,6 +905,15 @@ void WorkspaceFolder::registerTypes(const std::vector<std::string>& disabledGlob
 
             client->publishDiagnostics({uri, std::nullopt, diagnostics});
         }
+    }
+
+    if (auto mergedExports = buildMergedExportsDefinition(exportsEntriesToMerge))
+    {
+        client->sendTrace("workspace initialization: registering merged exports definition");
+        auto mergedResult = loadDefinitionFile("@workspace/merged-exports", *mergedExports);
+        if (!mergedResult.success)
+            client->sendWindowMessage(lsp::MessageType::Error, "Failed to register merged exports definitions from discovered .d.lua files");
+        client->sendTrace("workspace initialization: registering merged exports definition COMPLETED");
     }
 
     if (!disabledGlobals.empty())
