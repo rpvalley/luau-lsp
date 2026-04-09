@@ -193,6 +193,78 @@ TEST_CASE_FIXTURE(Fixture, "mta_meta_client_globals_are_not_visible_to_server_co
     CHECK_FALSE(getItem(serverResult, "CLIENT_ONLY").has_value());
 }
 
+TEST_CASE_FIXTURE(Fixture, "mta_meta_oop_class_globals_are_visible_with_public_instance_typing")
+{
+    switchToStandardPlatform();
+
+    tempDir.write_child("meta.xml", R"(
+        <meta>
+            <script src="shared.luau" type="shared" />
+            <script src="client.luau" type="client" />
+        </meta>
+    )");
+
+    const std::string sharedSource = R"(
+        type AppInstance = OopInstance & {
+            health: number,
+            getBark: (self: AppInstance) -> string,
+            load: (self: AppInstance) -> AppInstance,
+        }
+
+        local app = oop:create("ola", nil, nil, true) :: OopDefinitionOf<AppInstance>
+
+        function app.public:getBark()
+            return "woof"
+        end
+
+        function app.public:load()
+            self.health = 100
+            return self
+        end
+    )";
+
+    tempDir.write_child("shared.luau", sharedSource);
+    newDocument("shared.luau", sharedSource);
+
+    auto [globalSource, globalMarker] = sourceWithMarker("ol|");
+    auto clientUri = newDocument("client.luau", globalSource);
+
+    lsp::CompletionParams globalParams;
+    globalParams.textDocument = lsp::TextDocumentIdentifier{clientUri};
+    globalParams.position = globalMarker;
+
+    auto globalResult = workspace.completion(globalParams, nullptr);
+    CHECK(getItem(globalResult, "ola").has_value());
+
+    auto [classSource, classMarker] = sourceWithMarker("ola:|");
+    updateDocument(clientUri, classSource);
+
+    lsp::CompletionParams classParams;
+    classParams.textDocument = lsp::TextDocumentIdentifier{clientUri};
+    classParams.position = classMarker;
+
+    auto classResult = workspace.completion(classParams, nullptr);
+    CHECK(getItem(classResult, "create").has_value());
+    CHECK(getItem(classResult, "getBark").has_value());
+    CHECK(getItem(classResult, "load").has_value());
+
+    auto [instanceSource, instanceMarker] = sourceWithMarker(R"(
+        local instance = assert(ola:create())
+        instance.|
+    )");
+    updateDocument(clientUri, instanceSource);
+
+    lsp::CompletionParams instanceParams;
+    instanceParams.textDocument = lsp::TextDocumentIdentifier{clientUri};
+    instanceParams.position = instanceMarker;
+
+    auto instanceResult = workspace.completion(instanceParams, nullptr);
+    CHECK(getItem(instanceResult, "health").has_value());
+    CHECK(getItem(instanceResult, "getBark").has_value());
+    CHECK(getItem(instanceResult, "load").has_value());
+    CHECK_FALSE(getItem(instanceResult, "private").has_value());
+}
+
 TEST_CASE("merged_workspace_exports_completion_is_resource_scoped")
 {
     TempDir tempDir("luau_lsp_workspace_exports_completion");

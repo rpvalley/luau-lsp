@@ -190,6 +190,170 @@ struct MtaScriptEntry
     MTAScriptType type = MTAScriptType::Unknown;
 };
 
+static std::optional<std::string> astNameToString(const Luau::AstName& name)
+{
+    if (!name.value)
+        return std::nullopt;
+
+    return std::string(name.value);
+}
+
+static std::optional<std::string> simpleExprName(const Luau::AstExpr* expr)
+{
+    if (const auto* local = expr->as<Luau::AstExprLocal>())
+        return astNameToString(local->local->name);
+
+    if (const auto* global = expr->as<Luau::AstExprGlobal>())
+        return astNameToString(global->name);
+
+    return std::nullopt;
+}
+
+static std::optional<std::string> constantStringValue(const Luau::AstExpr* expr)
+{
+    const auto* stringExpr = expr->as<Luau::AstExprConstantString>();
+    if (!stringExpr || !stringExpr->value.data || stringExpr->value.size == 0)
+        return std::nullopt;
+
+    std::string value(stringExpr->value.data, stringExpr->value.size);
+    if (!value.empty() && value.back() == '\0')
+        value.pop_back();
+
+    return value;
+}
+
+static std::optional<std::string> oopClassTypeNameFromCreateArg(const Luau::AstExpr* expr)
+{
+    if (auto directString = constantStringValue(expr))
+        return directString;
+
+    const auto* tableExpr = expr->as<Luau::AstExprTable>();
+    if (!tableExpr)
+        return std::nullopt;
+
+    for (const auto& item : tableExpr->items)
+    {
+        if (item.kind != Luau::AstExprTable::Item::Record)
+            continue;
+
+        auto key = constantStringValue(item.key);
+        if (!key || (*key != "type" && *key != "name"))
+            continue;
+
+        if (auto typeName = constantStringValue(item.value))
+            return typeName;
+    }
+
+    return std::nullopt;
+}
+
+static bool isIdentifier(const std::string& value)
+{
+    if (value.empty())
+        return false;
+
+    auto isIdentifierStart = [](char c)
+    {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+    };
+
+    auto isIdentifierByte = [](char c)
+    {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+    };
+
+    if (!isIdentifierStart(value[0]))
+        return false;
+
+    for (size_t i = 1; i < value.size(); ++i)
+    {
+        if (!isIdentifierByte(value[i]))
+            return false;
+    }
+
+    return true;
+}
+
+struct OopClassBinding
+{
+    std::string globalName;
+    std::string localName;
+    std::optional<std::string> explicitPublicType;
+};
+
+static const Luau::AstExpr* unwrapTypeAssertionExpr(const Luau::AstExpr* expr)
+{
+    if (const auto* asserted = expr->as<Luau::AstExprTypeAssertion>())
+        return asserted->expr;
+
+    return expr;
+}
+
+static std::optional<std::string> extractOopPublicTypeFromAssertion(const Luau::AstExpr* expr, const std::string& source)
+{
+    const auto* asserted = expr->as<Luau::AstExprTypeAssertion>();
+    if (!asserted)
+        return std::nullopt;
+
+    const auto* annotationRef = asserted->annotation->as<Luau::AstTypeReference>();
+    if (!annotationRef)
+        return std::nullopt;
+
+    auto annotationName = astNameToString(annotationRef->name);
+    if (!annotationName || *annotationName != "OopDefinitionOf")
+        return std::nullopt;
+
+    if (annotationRef->parameters.size == 0 || !annotationRef->parameters.data[0].type)
+        return std::nullopt;
+
+    return sourceSliceFromLocation(source, annotationRef->parameters.data[0].type->location);
+}
+
+static std::optional<std::string> oopGlobalNameFromCreateCall(const Luau::AstExpr* expr)
+{
+    expr = unwrapTypeAssertionExpr(expr);
+
+    const auto* call = expr->as<Luau::AstExprCall>();
+    if (!call || !call->self || call->args.size == 0)
+        return std::nullopt;
+
+    const auto* member = call->func->as<Luau::AstExprIndexName>();
+    if (!member)
+        return std::nullopt;
+
+    auto memberName = astNameToString(member->index);
+    if (!memberName || (*memberName != "create" && *memberName != "define" && *memberName != "extend"))
+        return std::nullopt;
+
+    auto ownerName = simpleExprName(member->expr);
+    if (!ownerName || *ownerName != "oop")
+        return std::nullopt;
+
+    return oopClassTypeNameFromCreateArg(call->args.data[0]);
+}
+
+static std::optional<std::pair<std::string, std::string>> classPublicMethodName(const Luau::AstExpr* expr)
+{
+    const auto* methodExpr = expr->as<Luau::AstExprIndexName>();
+    if (!methodExpr)
+        return std::nullopt;
+
+    const auto* publicExpr = methodExpr->expr->as<Luau::AstExprIndexName>();
+    if (!publicExpr || publicExpr->op != '.')
+        return std::nullopt;
+
+    auto publicName = astNameToString(publicExpr->index);
+    if (!publicName || *publicName != "public")
+        return std::nullopt;
+
+    auto className = simpleExprName(publicExpr->expr);
+    auto methodName = astNameToString(methodExpr->index);
+    if (!className || !methodName)
+        return std::nullopt;
+
+    return std::make_pair(*className, *methodName);
+}
+
 static std::vector<MtaScriptEntry> parseMtaScriptEntries(const Uri& metaUri, const std::string& metaSource)
 {
     std::vector<MtaScriptEntry> entries;
@@ -268,6 +432,33 @@ static std::optional<std::string> extractTypedGlobalsPrelude(const std::string& 
 
     std::vector<std::string> typeAliases;
     std::vector<std::pair<std::string, std::string>> globalTypeBodies;
+    std::vector<OopClassBinding> oopClassBindings;
+    std::unordered_map<std::string, std::string> localToOopGlobal;
+    std::unordered_map<std::string, std::vector<std::pair<std::string, std::string>>> oopPublicMethodsByGlobal;
+
+    auto addOopClassBinding =
+        [&](std::string globalName, std::string localName, std::optional<std::string> explicitPublicType)
+    {
+        if (!isIdentifier(globalName) || !isIdentifier(localName))
+            return;
+
+        auto existingLocal = localToOopGlobal.find(localName);
+        if (existingLocal != localToOopGlobal.end() && existingLocal->second == globalName)
+        {
+            for (auto& binding : oopClassBindings)
+            {
+                if (binding.localName == localName && binding.globalName == globalName && explicitPublicType)
+                {
+                    binding.explicitPublicType = std::move(explicitPublicType);
+                    break;
+                }
+            }
+            return;
+        }
+
+        localToOopGlobal[localName] = globalName;
+        oopClassBindings.push_back({std::move(globalName), std::move(localName), std::move(explicitPublicType)});
+    };
 
     for (Luau::AstStat* stat : parseResult.root->body)
     {
@@ -287,6 +478,26 @@ static std::optional<std::string> extractTypedGlobalsPrelude(const std::string& 
                     if (auto valueSlice = sourceSliceFromLocation(source, assign->values.data[0]->location))
                         globalTypeBodies.emplace_back(global->name.value, "return " + *valueSlice);
                 }
+
+                if (auto oopGlobalName = oopGlobalNameFromCreateCall(assign->values.data[0]))
+                {
+                    if (auto varName = simpleExprName(assign->vars.data[0]))
+                        addOopClassBinding(*oopGlobalName, *varName, extractOopPublicTypeFromAssertion(assign->values.data[0], source));
+                }
+            }
+            continue;
+        }
+
+        if (auto* local = stat->as<Luau::AstStatLocal>())
+        {
+            size_t pairCount = std::min(local->vars.size, local->values.size);
+            for (size_t i = 0; i < pairCount; ++i)
+            {
+                if (auto oopGlobalName = oopGlobalNameFromCreateCall(local->values.data[i]))
+                {
+                    if (auto varName = astNameToString(local->vars.data[i]->name))
+                        addOopClassBinding(*oopGlobalName, *varName, extractOopPublicTypeFromAssertion(local->values.data[i], source));
+                }
             }
             continue;
         }
@@ -297,6 +508,26 @@ static std::optional<std::string> extractTypedGlobalsPrelude(const std::string& 
             {
                 if (auto functionSlice = sourceSliceFromLocation(source, fn->func->location))
                     globalTypeBodies.emplace_back(global->name.value, "return " + *functionSlice);
+            }
+
+            if (auto methodInfo = classPublicMethodName(fn->name))
+            {
+                const auto& [classLocalName, methodName] = *methodInfo;
+                if (auto it = localToOopGlobal.find(classLocalName); it != localToOopGlobal.end())
+                {
+                    if (auto functionSlice = sourceSliceFromLocation(source, fn->func->location))
+                    {
+                        auto& methods = oopPublicMethodsByGlobal[it->second];
+                        bool methodExists = std::any_of(methods.begin(), methods.end(),
+                            [&](const auto& pair)
+                            {
+                                return pair.first == methodName;
+                            });
+
+                        if (!methodExists)
+                            methods.emplace_back(methodName, *functionSlice);
+                    }
+                }
             }
         }
     }
@@ -324,6 +555,100 @@ static std::optional<std::string> extractTypedGlobalsPrelude(const std::string& 
         prelude += " = (nil :: any) :: __lsp_mta_global_";
         prelude += std::to_string(index - 1);
         prelude += "\n";
+    }
+
+    size_t oopIndex = 0;
+    for (const auto& binding : oopClassBindings)
+    {
+        if (!seen.insert(binding.globalName).second)
+            continue;
+
+        const std::string publicTypeName = "__lsp_mta_oop_public_" + std::to_string(oopIndex);
+        const std::string classTypeName = "__lsp_mta_oop_class_" + std::to_string(oopIndex);
+
+        if (binding.explicitPublicType)
+        {
+            prelude += "type ";
+            prelude += publicTypeName;
+            prelude += " = typeof((function()\n";
+            for (const auto& alias : typeAliases)
+            {
+                prelude += alias;
+                prelude += "\n";
+            }
+            prelude += "return (nil :: any) :: ";
+            prelude += *binding.explicitPublicType;
+            prelude += "\nend)())\n";
+        }
+        else
+        {
+            auto methodsIt = oopPublicMethodsByGlobal.find(binding.globalName);
+            if (methodsIt != oopPublicMethodsByGlobal.end())
+            {
+                for (size_t methodIndex = 0; methodIndex < methodsIt->second.size(); ++methodIndex)
+                {
+                    const auto& [methodName, functionSlice] = methodsIt->second[methodIndex];
+                    const std::string methodTypeName =
+                        "__lsp_mta_oop_method_" + std::to_string(oopIndex) + "_" + std::to_string(methodIndex);
+
+                    prelude += "type " + methodTypeName + " = typeof((function()\n";
+                    for (const auto& alias : typeAliases)
+                    {
+                        prelude += alias;
+                        prelude += "\n";
+                    }
+                    prelude += "return ";
+                    prelude += functionSlice;
+                    prelude += "\nend)())\n";
+                }
+            }
+
+            prelude += "type ";
+            prelude += publicTypeName;
+            prelude += " = {\n";
+
+            if (methodsIt != oopPublicMethodsByGlobal.end())
+            {
+                for (size_t methodIndex = 0; methodIndex < methodsIt->second.size(); ++methodIndex)
+                {
+                    const auto& [methodName, _] = methodsIt->second[methodIndex];
+                    const std::string methodTypeName =
+                        "__lsp_mta_oop_method_" + std::to_string(oopIndex) + "_" + std::to_string(methodIndex);
+
+                    prelude += "    ";
+                    prelude += methodName;
+                    prelude += ": ";
+                    prelude += methodTypeName;
+                    prelude += ",\n";
+                }
+            }
+
+            prelude += "}\n";
+        }
+
+        prelude += "type ";
+        prelude += classTypeName;
+        prelude += " = ";
+        prelude += publicTypeName;
+        prelude += " & {\n";
+        prelude += "    create: (self: ";
+        prelude += publicTypeName;
+        prelude += ", ...any) -> ";
+        prelude += publicTypeName;
+        prelude += ",\n";
+        prelude += "    createInstance: (self: ";
+        prelude += publicTypeName;
+        prelude += ") -> ";
+        prelude += publicTypeName;
+        prelude += ",\n";
+        prelude += "}\n";
+
+        prelude += binding.globalName;
+        prelude += " = (nil :: any) :: ";
+        prelude += classTypeName;
+        prelude += "\n";
+
+        ++oopIndex;
     }
 
     // Fallback for files where AST extraction misses globals (e.g. partial parse states).
