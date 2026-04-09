@@ -5,6 +5,47 @@
 
 TEST_SUITE_BEGIN("GoToDefinition");
 
+TEST_CASE_FIXTURE(Fixture, "mta_meta_global_variable_definition_across_scripts")
+{
+    switchToStandardPlatform();
+
+    tempDir.write_child("meta.xml", R"(
+        <meta>
+            <lua client="luau" server="luau" both="luau" />
+            <script src="shared.luau" type="server" />
+            <script src="client.luau" type="server" />
+        </meta>
+    )");
+
+    const std::string sharedSource = R"(
+        export type NamesType = {
+            name: string,
+            id: number,
+        }
+
+        SOME_VARIABLE = {
+            name = "John Doe",
+            id = 12345,
+        } :: NamesType
+    )";
+    tempDir.write_child("shared.luau", sharedSource);
+    auto shared = newDocument("shared.luau", sharedSource);
+
+    auto [clientSource, clientPosition] = sourceWithMarker(R"(
+        local _ = SOME_VAR|IABLE.name
+    )");
+    tempDir.write_child("client.luau", clientSource);
+    auto client = newDocument("client.luau", clientSource);
+
+    auto params = lsp::DefinitionParams{};
+    params.textDocument = lsp::TextDocumentIdentifier{client};
+    params.position = clientPosition;
+
+    auto result = workspace.gotoDefinition(params, nullptr);
+    REQUIRE_EQ(result.size(), 1);
+    CHECK_EQ(result[0].uri.filename(), shared.filename());
+}
+
 TEST_CASE_FIXTURE(Fixture, "local_variable_definition")
 {
     auto [source, position] = sourceWithMarker(R"(

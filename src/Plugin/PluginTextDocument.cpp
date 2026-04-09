@@ -22,10 +22,23 @@ Luau::Position PluginTextDocument::convertPosition(const lsp::Position& position
     Luau::Position originalPos = originalDoc.convertPosition(position);
 
     // Then map from original to transformed position
-    if (auto transformedPos = mapping.originalToTransformed(originalPos))
-        return *transformedPos;
+    Luau::Position transformedPos = originalPos;
+    if (auto mapped = mapping.originalToTransformed(originalPos))
+        transformedPos = *mapped;
 
-    return originalPos;
+    // Clamp to valid transformed bounds.
+    size_t transformedLineCount = lineCount();
+    if (transformedLineCount == 0)
+        return Luau::Position{0, 0};
+
+    if (transformedPos.line >= transformedLineCount)
+        transformedPos.line = static_cast<unsigned int>(transformedLineCount - 1);
+
+    const std::string transformedLineText = getLine(transformedPos.line);
+    if (transformedPos.column > transformedLineText.size())
+        transformedPos.column = static_cast<unsigned int>(transformedLineText.size());
+
+    return transformedPos;
 }
 
 lsp::Position PluginTextDocument::convertPosition(const Luau::Position& position) const
@@ -34,6 +47,19 @@ lsp::Position PluginTextDocument::convertPosition(const Luau::Position& position
     Luau::Position originalPos = position;
     if (auto mapped = mapping.transformedToOriginal(position))
         originalPos = *mapped;
+
+    // Mapping can land outside original bounds for synthesized-only regions.
+    // Clamp to a valid original position before converting to LSP coordinates.
+    size_t originalLineCount = originalDoc.lineCount();
+    if (originalLineCount == 0)
+        return lsp::Position{0, 0};
+
+    if (originalPos.line >= originalLineCount)
+        originalPos.line = static_cast<unsigned int>(originalLineCount - 1);
+
+    const std::string lineText = originalDoc.getLine(originalPos.line);
+    if (originalPos.column > lineText.size())
+        originalPos.column = static_cast<unsigned int>(lineText.size());
 
     // Convert original Luau position to LSP position using ORIGINAL content
     return originalDoc.convertPosition(originalPos);

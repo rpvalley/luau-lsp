@@ -62,6 +62,136 @@ struct FragmentAutocompleteFixture : Fixture
 
 TEST_SUITE_BEGIN("Autocomplete");
 
+TEST_CASE_FIXTURE(Fixture, "mta_meta_shared_globals_are_visible_to_client_completion")
+{
+    switchToStandardPlatform();
+
+    tempDir.write_child("meta.xml", R"(
+        <meta>
+            <script src="shared.luau" type="shared" />
+            <script src="client.luau" type="client" />
+            <script src="server.luau" type="server" />
+        </meta>
+    )");
+
+    const std::string sharedSource = R"(
+        type NameTypes = {
+            [string]: string,
+        }
+
+        NAMES = {
+            class = "class",
+            namespace = "namespace",
+        } :: NameTypes
+    )";
+    tempDir.write_child("shared.luau", sharedSource);
+    newDocument("shared.luau", sharedSource);
+
+    auto [source, marker] = sourceWithMarker("NA|");
+    tempDir.write_child("client.luau", source);
+    auto uri = newDocument("client.luau", source);
+
+    lsp::CompletionParams params;
+    params.textDocument = lsp::TextDocumentIdentifier{uri};
+    params.position = marker;
+
+    auto result = workspace.completion(params, nullptr);
+    CHECK(getItem(result, "NAMES").has_value());
+
+}
+
+TEST_CASE_FIXTURE(Fixture, "mta_meta_export_type_global_is_visible_in_client_completion")
+{
+    switchToStandardPlatform();
+
+    tempDir.write_child("meta.xml", R"(
+        <meta>
+            <lua client="luau" server="luau" both="luau" />
+            <script src="shared.luau" type="server" />
+            <script src="client.luau" type="server" />
+        </meta>
+    )");
+
+    const std::string sharedSource = R"(
+        export type NamesType = {
+            name: string,
+            id: number,
+        }
+
+        SOME_VARIABLE = {
+            name = "John Doe",
+            id = 12345,
+        } :: NamesType
+    )";
+
+    tempDir.write_child("shared.luau", sharedSource);
+    newDocument("shared.luau", sharedSource);
+
+    auto [clientSource, marker] = sourceWithMarker("SO|");
+    tempDir.write_child("client.luau", clientSource);
+    auto clientUri = newDocument("client.luau", clientSource);
+
+    auto transformedClientDoc = workspace.fileResolver.getTextDocument(clientUri);
+    REQUIRE(transformedClientDoc != nullptr);
+    CHECK_NE(transformedClientDoc->getText().find("SOME_VARIABLE = (nil :: any) :: __lsp_mta_global_"), std::string::npos);
+
+    lsp::CompletionParams params;
+    params.textDocument = lsp::TextDocumentIdentifier{clientUri};
+    params.position = marker;
+
+    auto result = workspace.completion(params, nullptr);
+    CHECK(getItem(result, "SOME_VARIABLE").has_value());
+
+    auto [memberSource, memberMarker] = sourceWithMarker("SOME_VARIABLE.|");
+    tempDir.write_child("client.luau", memberSource);
+    updateDocument(clientUri, memberSource);
+
+    lsp::CompletionParams memberParams;
+    memberParams.textDocument = lsp::TextDocumentIdentifier{clientUri};
+    memberParams.position = memberMarker;
+
+    auto memberResult = workspace.completion(memberParams, nullptr);
+    CHECK(getItem(memberResult, "name").has_value());
+    CHECK(getItem(memberResult, "id").has_value());
+}
+
+TEST_CASE_FIXTURE(Fixture, "mta_meta_client_globals_are_not_visible_to_server_completion")
+{
+    switchToStandardPlatform();
+
+    tempDir.write_child("meta.xml", R"(
+        <meta>
+            <script src="shared.luau" type="shared" />
+            <script src="client_globals.luau" type="client" />
+            <script src="client.luau" type="client" />
+            <script src="server.luau" type="server" />
+        </meta>
+    )");
+
+    newDocument("shared.luau", "SHARED_VALUE = 1");
+    newDocument("client_globals.luau", "CLIENT_ONLY = 123");
+
+    auto [clientSource, clientMarker] = sourceWithMarker("CL|");
+    auto clientUri = newDocument("client.luau", clientSource);
+
+    lsp::CompletionParams clientParams;
+    clientParams.textDocument = lsp::TextDocumentIdentifier{clientUri};
+    clientParams.position = clientMarker;
+
+    auto clientResult = workspace.completion(clientParams, nullptr);
+    CHECK(getItem(clientResult, "CLIENT_ONLY").has_value());
+
+    auto [serverSource, serverMarker] = sourceWithMarker("CL|");
+    auto serverUri = newDocument("server.luau", serverSource);
+
+    lsp::CompletionParams serverParams;
+    serverParams.textDocument = lsp::TextDocumentIdentifier{serverUri};
+    serverParams.position = serverMarker;
+
+    auto serverResult = workspace.completion(serverParams, nullptr);
+    CHECK_FALSE(getItem(serverResult, "CLIENT_ONLY").has_value());
+}
+
 TEST_CASE_FIXTURE(Fixture, "function_autocomplete_has_documentation")
 {
     auto [source, marker] = sourceWithMarker(R"(

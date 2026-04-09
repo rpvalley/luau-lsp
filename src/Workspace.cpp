@@ -57,8 +57,8 @@ void WorkspaceFolder::updateTextDocument(const lsp::DocumentUri& uri, const lsp:
     auto& textDocument = fileResolver.managedFiles.at(uri);
     textDocument.update(params.contentChanges, params.textDocument.version);
 
-    // Invalidate plugin cache for this document - forces re-transformation on next access
-    fileResolver.invalidatePluginDocument(uri);
+    // Invalidate transformed document cache. Transformations can depend on other files (plugins/MTA meta visibility).
+    fileResolver.clearPluginDocuments();
 
     // Keep a vector of reverse dependencies marked dirty to extend diagnostics for them
     std::vector<Luau::ModuleName> markedDirty{};

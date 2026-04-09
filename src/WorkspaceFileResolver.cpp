@@ -1,8 +1,14 @@
 #include <optional>
 #include <unordered_map>
 #include <iostream>
+#include <algorithm>
+#include <cctype>
+#include <regex>
+#include <unordered_set>
+#include <vector>
 #include "Luau/Ast.h"
 #include "Luau/LuauConfig.h"
+#include "Luau/Parser.h"
 #include "LSP/WorkspaceFileResolver.hpp"
 
 #include "Luau/TimeTrace.h"
@@ -19,6 +25,365 @@ struct LuauConfigInterruptInfo
     Luau::TypeCheckLimits limits;
     std::string module;
 };
+
+namespace
+{
+enum class MTAScriptType
+{
+    Unknown,
+    Client,
+    Server,
+    Shared,
+};
+
+static std::string normalizePath(std::string path)
+{
+    std::replace(path.begin(), path.end(), '\\', '/');
+    std::transform(path.begin(), path.end(), path.begin(),
+        [](unsigned char c)
+        {
+            return static_cast<char>(std::tolower(c));
+        });
+    return path;
+}
+
+static MTAScriptType parseMtaScriptType(const std::string& scriptType)
+{
+    std::string lowered = scriptType;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+        [](unsigned char c)
+        {
+            return static_cast<char>(std::tolower(c));
+        });
+
+    if (lowered == "client")
+        return MTAScriptType::Client;
+    if (lowered == "shared")
+        return MTAScriptType::Shared;
+    if (lowered == "server" || lowered.empty())
+        return MTAScriptType::Server;
+
+    return MTAScriptType::Unknown;
+}
+
+static std::optional<Uri> findResourceMetaFile(Uri uri)
+{
+    if (uri.scheme != "file")
+        return std::nullopt;
+
+    std::optional<Uri> current = uri.parent();
+    while (current)
+    {
+        auto meta = current->resolvePath("meta.xml");
+        if (meta.exists())
+            return meta;
+        current = current->parent();
+    }
+
+    return std::nullopt;
+}
+
+static std::optional<size_t> offsetFromPosition(const std::string& source, const Luau::Position& pos)
+{
+    size_t line = 0;
+    size_t column = 0;
+
+    for (size_t i = 0; i < source.size(); ++i)
+    {
+        if (line == pos.line && column == pos.column)
+            return i;
+
+        char ch = source[i];
+        if (ch == '\r')
+        {
+            if (i + 1 < source.size() && source[i + 1] == '\n')
+                ++i;
+            ++line;
+            column = 0;
+        }
+        else if (ch == '\n')
+        {
+            ++line;
+            column = 0;
+        }
+        else
+            ++column;
+    }
+
+    if (line == pos.line && column == pos.column)
+        return source.size();
+
+    return std::nullopt;
+}
+
+static std::optional<std::string> sourceSliceFromLocation(const std::string& source, const Luau::Location& location)
+{
+    auto start = offsetFromPosition(source, location.begin);
+    auto end = offsetFromPosition(source, location.end);
+    if (!start || !end || *start > *end || *end > source.size())
+        return std::nullopt;
+
+    return source.substr(*start, *end - *start);
+}
+
+static Luau::Position endPosition(const std::string& source)
+{
+    Luau::Position pos{0, 0};
+    for (size_t i = 0; i < source.size(); ++i)
+    {
+        char ch = source[i];
+        if (ch == '\r')
+        {
+            if (i + 1 < source.size() && source[i + 1] == '\n')
+                ++i;
+            ++pos.line;
+            pos.column = 0;
+        }
+        else if (ch == '\n')
+        {
+            ++pos.line;
+            pos.column = 0;
+        }
+        else
+            ++pos.column;
+    }
+    return pos;
+}
+
+static Luau::Position preludeInsertionPosition(const std::string& source)
+{
+    // Keep Luau mode directives (`--!strict`, etc.) at the beginning of file.
+    // Insert declarations right after any leading directive lines.
+    size_t index = 0;
+    unsigned int line = 0;
+
+    while (index < source.size())
+    {
+        size_t lineStart = index;
+        while (index < source.size() && source[index] != '\n' && source[index] != '\r')
+            ++index;
+
+        size_t lineEnd = index;
+
+        // Handle CRLF/CR/LF
+        if (index < source.size())
+        {
+            if (source[index] == '\r' && index + 1 < source.size() && source[index + 1] == '\n')
+                index += 2;
+            else
+                index += 1;
+        }
+
+        std::string lineText = source.substr(lineStart, lineEnd - lineStart);
+        if (!(lineText.rfind("--!", 0) == 0))
+            return Luau::Position{line, 0};
+
+        ++line;
+    }
+
+    return Luau::Position{line, 0};
+}
+
+struct MtaScriptEntry
+{
+    Uri uri;
+    MTAScriptType type = MTAScriptType::Unknown;
+};
+
+static std::vector<MtaScriptEntry> parseMtaScriptEntries(const Uri& metaUri, const std::string& metaSource)
+{
+    std::vector<MtaScriptEntry> entries;
+    const auto parent = metaUri.parent();
+    if (!parent)
+        return entries;
+
+    static const std::regex scriptTagRegex(R"(<\s*script\b([^>]*)>)", std::regex::icase);
+    static const std::regex attrRegex(R"mta(([A-Za-z0-9_:\-]+)\s*=\s*("([^"]*)"|'([^']*)'))mta", std::regex::icase);
+
+    auto it = std::sregex_iterator(metaSource.begin(), metaSource.end(), scriptTagRegex);
+    auto end = std::sregex_iterator();
+    for (; it != end; ++it)
+    {
+        std::string attrs = (*it)[1].str();
+        std::string src;
+        std::string type = "server";
+
+        auto attrIt = std::sregex_iterator(attrs.begin(), attrs.end(), attrRegex);
+        for (; attrIt != end; ++attrIt)
+        {
+            auto key = (*attrIt)[1].str();
+            auto value = (*attrIt)[3].matched ? (*attrIt)[3].str() : (*attrIt)[4].str();
+
+            std::transform(key.begin(), key.end(), key.begin(),
+                [](unsigned char c)
+                {
+                    return static_cast<char>(std::tolower(c));
+                });
+
+            if (key == "src")
+                src = value;
+            else if (key == "type")
+                type = value;
+        }
+
+        if (src.empty())
+            continue;
+
+        entries.push_back(MtaScriptEntry{parent->resolvePath(src), parseMtaScriptType(type)});
+    }
+
+    return entries;
+}
+
+static std::optional<std::string> extractTypedGlobalsPrelude(const std::string& source)
+{
+    auto normalizeTypeAliasForLocalScope = [](std::string alias) {
+        size_t i = 0;
+        while (i < alias.size() && std::isspace(static_cast<unsigned char>(alias[i])))
+            ++i;
+
+        static constexpr const char* exportType = "export type";
+        if (alias.compare(i, std::char_traits<char>::length(exportType), exportType) == 0)
+            alias.erase(i, std::char_traits<char>::length("export "));
+
+        return alias;
+    };
+
+    std::string parseSource = source;
+    size_t parseIndex = 0;
+    while ((parseIndex = parseSource.find("export type", parseIndex)) != std::string::npos)
+    {
+        // Replace only the `export ` prefix with spaces to preserve source offsets.
+        parseSource.replace(parseIndex, 7, "       ");
+        parseIndex += 11;
+    }
+
+    Luau::Allocator allocator;
+    Luau::AstNameTable names{allocator};
+    Luau::ParseOptions options;
+    Luau::ParseResult parseResult = Luau::Parser::parse(parseSource.c_str(), parseSource.size(), names, allocator, options);
+
+    if (!parseResult.root)
+        return std::nullopt;
+
+    std::vector<std::string> typeAliases;
+    std::vector<std::pair<std::string, std::string>> globalTypeBodies;
+
+    for (Luau::AstStat* stat : parseResult.root->body)
+    {
+        if (auto* alias = stat->as<Luau::AstStatTypeAlias>())
+        {
+            if (auto slice = sourceSliceFromLocation(source, alias->location))
+                typeAliases.push_back(normalizeTypeAliasForLocalScope(*slice));
+            continue;
+        }
+
+        if (auto* assign = stat->as<Luau::AstStatAssign>())
+        {
+            if (assign->vars.size == 1 && assign->values.size == 1)
+            {
+                if (auto* global = assign->vars.data[0]->as<Luau::AstExprGlobal>())
+                {
+                    if (auto valueSlice = sourceSliceFromLocation(source, assign->values.data[0]->location))
+                        globalTypeBodies.emplace_back(global->name.value, "return " + *valueSlice);
+                }
+            }
+            continue;
+        }
+
+        if (auto* fn = stat->as<Luau::AstStatFunction>())
+        {
+            if (auto* global = fn->name->as<Luau::AstExprGlobal>())
+            {
+                if (auto functionSlice = sourceSliceFromLocation(source, fn->func->location))
+                    globalTypeBodies.emplace_back(global->name.value, "return " + *functionSlice);
+            }
+        }
+    }
+
+    std::string prelude;
+    prelude.reserve(512);
+    prelude += "\n--!nolint\n";
+
+    std::unordered_set<std::string> seen;
+    size_t index = 0;
+    for (const auto& [name, typeBody] : globalTypeBodies)
+    {
+        if (!seen.insert(name).second)
+            continue;
+
+        prelude += "type __lsp_mta_global_" + std::to_string(index++) + " = typeof((function()\n";
+        for (const auto& alias : typeAliases)
+        {
+            prelude += alias;
+            prelude += "\n";
+        }
+        prelude += typeBody;
+        prelude += "\nend)())\n";
+        prelude += name;
+        prelude += " = (nil :: any) :: __lsp_mta_global_";
+        prelude += std::to_string(index - 1);
+        prelude += "\n";
+    }
+
+    // Fallback for files where AST extraction misses globals (e.g. partial parse states).
+    // We still expose top-level global names for completion, even without rich type details.
+    auto isIdentifierByte = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+    };
+
+    size_t lineStart = 0;
+    while (lineStart <= source.size())
+    {
+        size_t lineEnd = source.find('\n', lineStart);
+        if (lineEnd == std::string::npos)
+            lineEnd = source.size();
+
+        size_t i = lineStart;
+        while (i < lineEnd && (source[i] == ' ' || source[i] == '\t' || source[i] == '\r'))
+            ++i;
+
+        if (i < lineEnd && isIdentifierByte(source[i]))
+        {
+            size_t j = i + 1;
+            while (j < lineEnd && isIdentifierByte(source[j]))
+                ++j;
+
+            std::string name = source.substr(i, j - i);
+
+            size_t k = j;
+            while (k < lineEnd && (source[k] == ' ' || source[k] == '\t'))
+                ++k;
+
+            if (k < lineEnd && source[k] == '=' && seen.insert(name).second)
+            {
+                prelude += name;
+                prelude += " = nil :: any\n";
+            }
+        }
+
+        if (lineEnd == source.size())
+            break;
+        lineStart = lineEnd + 1;
+    }
+
+    if (seen.empty())
+        return std::nullopt;
+
+    return prelude;
+}
+
+static bool canSeeScriptType(MTAScriptType target, MTAScriptType provider)
+{
+    if (target == MTAScriptType::Client)
+        return provider == MTAScriptType::Client || provider == MTAScriptType::Shared;
+    if (target == MTAScriptType::Server)
+        return provider == MTAScriptType::Server || provider == MTAScriptType::Shared;
+    if (target == MTAScriptType::Shared)
+        return provider == MTAScriptType::Shared;
+    return false;
+}
+} // namespace
 
 Luau::ModuleName WorkspaceFileResolver::getModuleName(const Uri& name) const
 {
@@ -61,11 +426,7 @@ const TextDocument* WorkspaceFileResolver::getTextDocument(const lsp::DocumentUr
     if (!original)
         return nullptr;
 
-    // If no plugins active, return original
-    if (!pluginManager || !pluginManager->hasPlugins())
-        return original;
-
-    // Check cache for existing plugin document
+    // Check cache for existing transformed document
     auto it = pluginDocuments.find(uri);
     if (it != pluginDocuments.end() && it->second && it->second->version() == original->version())
         return it->second.get();
@@ -102,14 +463,27 @@ void WorkspaceFileResolver::clearPluginDocuments()
 std::optional<Luau::LanguageServer::Plugin::TransformResult> WorkspaceFileResolver::applyPluginTransformation(
     const std::string& source, const Uri& uri, const std::string& moduleName) const
 {
-    if (!pluginManager || !pluginManager->hasPlugins())
-        return std::nullopt;
+    std::vector<Luau::LanguageServer::Plugin::TextEdit> edits;
 
-    // Plugins should not apply to their own source files
-    if (pluginManager->isPluginFile(uri))
-        return std::nullopt;
+    if (pluginManager && pluginManager->hasPlugins())
+    {
+        // Plugins should not apply to their own source files
+        if (!pluginManager->isPluginFile(uri))
+        {
+            auto pluginEdits = pluginManager->transform(source, uri, moduleName);
+            edits.insert(edits.end(), pluginEdits.begin(), pluginEdits.end());
+        }
+    }
 
-    auto edits = pluginManager->transform(source, uri, moduleName);
+    if (auto mtaDeclarations = buildMtaGlobalDeclarations(uri))
+    {
+        auto pos = preludeInsertionPosition(source);
+        edits.push_back(Luau::LanguageServer::Plugin::TextEdit{
+            Luau::Location{pos, pos},
+            *mtaDeclarations,
+        });
+    }
+
     if (edits.empty())
         return std::nullopt;
 
@@ -123,6 +497,83 @@ std::optional<Luau::LanguageServer::Plugin::TransformResult> WorkspaceFileResolv
             client->sendLogMessage(lsp::MessageType::Error, "Failed to apply plugin transformation: " + std::string(e.what()));
         return std::nullopt;
     }
+}
+
+std::optional<std::string> WorkspaceFileResolver::buildMtaGlobalDeclarations(const Uri& uri) const
+{
+    auto metaUri = findResourceMetaFile(uri);
+    if (!metaUri)
+        return std::nullopt;
+
+    auto metaSource = Luau::FileUtils::readFile(metaUri->fsPath());
+    if (!metaSource)
+        return std::nullopt;
+
+    auto scriptEntries = parseMtaScriptEntries(*metaUri, *metaSource);
+    if (scriptEntries.empty())
+        return std::nullopt;
+
+    const auto targetPath = normalizePath(uri.fsPath());
+
+    MTAScriptType targetType = MTAScriptType::Unknown;
+    for (const auto& entry : scriptEntries)
+    {
+        if (normalizePath(entry.uri.fsPath()) == targetPath)
+        {
+            targetType = entry.type;
+            break;
+        }
+    }
+
+    if (targetType == MTAScriptType::Unknown)
+        return std::nullopt;
+
+    std::unordered_set<std::string> seenFilePaths;
+    std::string declarations;
+
+    for (const auto& entry : scriptEntries)
+    {
+        if (!canSeeScriptType(targetType, entry.type))
+            continue;
+
+        std::string providerPath = normalizePath(entry.uri.fsPath());
+        if (providerPath == targetPath)
+            continue;
+
+        if (!seenFilePaths.insert(providerPath).second)
+            continue;
+
+        std::optional<std::string> providerSource;
+        if (auto* managed = getManagedTextDocument(entry.uri))
+            providerSource = managed->getText();
+        else
+        {
+            // Some clients may normalize file URIs differently (drive-letter casing, escaping).
+            // Fall back to matching managed documents by normalized file path.
+            for (const auto& [managedUri, managedDoc] : managedFiles)
+            {
+                if (normalizePath(managedUri.fsPath()) == providerPath)
+                {
+                    providerSource = managedDoc.getText();
+                    break;
+                }
+            }
+
+            if (!providerSource)
+                providerSource = Luau::FileUtils::readFile(entry.uri.fsPath());
+        }
+
+        if (!providerSource)
+            continue;
+
+        if (auto prelude = extractTypedGlobalsPrelude(*providerSource))
+            declarations += *prelude;
+    }
+
+    if (declarations.empty())
+        return std::nullopt;
+
+    return declarations;
 }
 
 const TextDocument* WorkspaceFileResolver::getTextDocumentFromModuleName(const Luau::ModuleName& name) const

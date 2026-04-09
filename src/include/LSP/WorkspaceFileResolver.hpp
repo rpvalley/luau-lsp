@@ -145,6 +145,9 @@ public:
     std::optional<Luau::LanguageServer::Plugin::TransformResult> applyPluginTransformation(
         const std::string& source, const Uri& uri, const std::string& moduleName) const;
 
+    /// Build additional type-only declarations from MTA meta.xml script visibility.
+    std::optional<std::string> buildMtaGlobalDeclarations(const Uri& uri) const;
+
     // Plugin environment support
     bool isPluginFile(const Luau::ModuleName& name) const;
 };
