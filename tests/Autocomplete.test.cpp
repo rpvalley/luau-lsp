@@ -134,7 +134,7 @@ TEST_CASE_FIXTURE(Fixture, "mta_meta_export_type_global_is_visible_in_client_com
 
     auto transformedClientDoc = workspace.fileResolver.getTextDocument(clientUri);
     REQUIRE(transformedClientDoc != nullptr);
-    CHECK_NE(transformedClientDoc->getText().find("SOME_VARIABLE = (nil :: any) :: __lsp_mta_global_"), std::string::npos);
+    CHECK_NE(transformedClientDoc->getText().find("local SOME_VARIABLE = (nil :: any) :: __lsp_mta_global_"), std::string::npos);
 
     lsp::CompletionParams params;
     params.textDocument = lsp::TextDocumentIdentifier{clientUri};
@@ -472,6 +472,52 @@ TEST_CASE_FIXTURE(Fixture, "metatable_oop_completions_for_class_public_and_self"
     CHECK(getItem(selfResult, "load").has_value());
 }
 
+TEST_CASE_FIXTURE(Fixture, "metatable_oop_typed_public_colon_completion_uses_class_props")
+{
+    auto [dotSource, dotMarker] = sourceWithMarker(R"(
+        import "class"
+
+        type TestClassProps = OopInstance & {
+            test: (self: TestClassProps, data: { agc: number }) -> string,
+        }
+
+        local TestClass = oop:create('TestClass', nil, nil, true) :: OopDefinitionOf<TestClassProps>
+
+        function TestClass.|
+    )");
+
+    auto uri = newDocument("typed_public_colon.luau", dotSource);
+
+    lsp::CompletionParams dotParams;
+    dotParams.textDocument = lsp::TextDocumentIdentifier{uri};
+    dotParams.position = dotMarker;
+
+    auto dotResult = workspace.completion(dotParams, nullptr);
+    CHECK(getItem(dotResult, "public").has_value());
+
+    auto [source, marker] = sourceWithMarker(R"(
+        import "class"
+
+        type TestClassProps = OopInstance & {
+            test: (self: TestClassProps, data: { agc: number }) -> string,
+        }
+
+        local TestClass = oop:create('TestClass', nil, nil, true) :: OopDefinitionOf<TestClassProps>
+
+        function TestClass.public:|
+    )");
+
+    updateDocument(uri, source);
+
+    lsp::CompletionParams params;
+    params.textDocument = lsp::TextDocumentIdentifier{uri};
+    params.position = marker;
+
+    auto result = workspace.completion(params, nullptr);
+    CHECK(getItem(result, "test").has_value());
+    CHECK_FALSE(getItem(result, "__lsp_mta_oop_class_0_0").has_value());
+}
+
 TEST_CASE_FIXTURE(Fixture, "function_autocomplete_has_documentation")
 {
     auto [source, marker] = sourceWithMarker(R"(
@@ -709,6 +755,36 @@ TEST_CASE_FIXTURE(Fixture, "type_reference_has_documentation")
     CHECK_EQ(typeEntry->documentation->kind, lsp::MarkupKind::Markdown);
     trim(typeEntry->documentation->value);
     CHECK_EQ(typeEntry->documentation->value, "Some documentation");
+}
+
+TEST_CASE_FIXTURE(Fixture, "d_luau_type_context_suggests_imports_in_incomplete_function_type")
+{
+    client->globalConfig.completion.imports.enabled = true;
+
+    auto definitionsUri = newDocument("some.d.luau", R"(
+        export type MyFuckProps = {
+            bozofreak: string,
+        }
+    )");
+    workspace.frontend.parse(workspace.fileResolver.getModuleName(definitionsUri));
+    workspace.indexFiles(client->globalConfig);
+
+    auto [source, marker] = sourceWithMarker(R"(
+        declare exports: {
+            ['valley_inventory']: {
+                openSkillTree: (self: any, args: |) -> number,
+            }
+        }
+    )");
+
+    auto uri = newDocument("other.d.luau", source);
+
+    lsp::CompletionParams params;
+    params.textDocument = lsp::TextDocumentIdentifier{uri};
+    params.position = marker;
+
+    auto result = workspace.completion(params, nullptr);
+    CHECK(getItem(result, "MyFuckProps").has_value());
 }
 
 TEST_CASE_FIXTURE(Fixture, "imported_type_reference_has_documentation")

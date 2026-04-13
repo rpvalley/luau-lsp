@@ -155,6 +155,87 @@ static std::optional<std::string> normalizeFunctionExpressionSlice(std::string f
     return std::string("function") + functionSlice.substr(openParen);
 }
 
+static std::optional<std::string> sourceSliceForType(const std::string& source, const Luau::AstType* type)
+{
+    if (!type)
+        return std::nullopt;
+
+    return sourceSliceFromLocation(source, type->location);
+}
+
+static std::optional<std::string> sourceSliceForTypePack(const std::string& source, const Luau::AstTypePack* typePack)
+{
+    if (!typePack)
+        return std::nullopt;
+
+    return sourceSliceFromLocation(source, typePack->location);
+}
+
+static std::string safeNameOr(const Luau::AstName& name, const std::string& fallback)
+{
+    if (name.value)
+        return std::string(name.value);
+
+    return fallback;
+}
+
+static std::string buildFunctionTypeFromAst(const std::string& source, const Luau::AstExprFunction* func)
+{
+    std::string type = "(";
+    bool first = true;
+
+    auto appendArg = [&](const std::string& name, const std::string& argType)
+    {
+        if (!first)
+            type += ", ";
+
+        type += name;
+        type += ": ";
+        type += argType;
+        first = false;
+    };
+
+    if (func->self)
+    {
+        std::string selfType = "any";
+        if (auto selfAnn = sourceSliceForType(source, func->self->annotation))
+            selfType = *selfAnn;
+
+        appendArg("self", selfType);
+    }
+
+    for (size_t i = 0; i < func->args.size; ++i)
+    {
+        auto* arg = func->args.data[i];
+        std::string argType = "any";
+        if (auto argAnn = sourceSliceForType(source, arg->annotation))
+            argType = *argAnn;
+
+        appendArg(safeNameOr(arg->name, "arg" + std::to_string(i)), argType);
+    }
+
+    if (func->vararg)
+    {
+        std::string varargType = "...any";
+        if (auto varargAnn = sourceSliceForTypePack(source, func->varargAnnotation))
+            varargType = "..." + *varargAnn;
+
+        if (!first)
+            type += ", ";
+        type += varargType;
+        first = false;
+    }
+
+    type += ") -> ";
+
+    if (auto returnAnn = sourceSliceForTypePack(source, func->returnAnnotation))
+        type += *returnAnn;
+    else
+        type += "any";
+
+    return type;
+}
+
 static std::optional<std::string> astNameToString(const Luau::AstName& name);
 static bool isIdentifier(const std::string& value);
 
@@ -260,6 +341,56 @@ static std::optional<std::string> buildUsedGlobalFunctionsPrelude(
     }
 
     return prelude;
+}
+
+static bool hasLikelyGlobalFunctionCall(const std::string& source, const std::string& functionName)
+{
+    size_t pos = 0;
+    while ((pos = source.find(functionName, pos)) != std::string::npos)
+    {
+        bool leftOk = (pos == 0) || !std::isalnum(static_cast<unsigned char>(source[pos - 1])) && source[pos - 1] != '_';
+        if (!leftOk)
+        {
+            ++pos;
+            continue;
+        }
+
+        size_t afterName = pos + functionName.size();
+        bool rightBoundary = (afterName >= source.size()) ||
+            (!std::isalnum(static_cast<unsigned char>(source[afterName])) && source[afterName] != '_');
+        if (!rightBoundary)
+        {
+            ++pos;
+            continue;
+        }
+
+        size_t i = afterName;
+        while (i < source.size() && std::isspace(static_cast<unsigned char>(source[i])))
+            ++i;
+
+        if (i >= source.size() || source[i] != '(')
+        {
+            ++pos;
+            continue;
+        }
+
+        size_t lineStart = source.rfind('\n', pos);
+        if (lineStart == std::string::npos)
+            lineStart = 0;
+        else
+            ++lineStart;
+
+        std::string linePrefix = source.substr(lineStart, pos - lineStart);
+        if (linePrefix.find("function") != std::string::npos)
+        {
+            ++pos;
+            continue;
+        }
+
+        return true;
+    }
+
+    return false;
 }
 
 static Luau::Position endPosition(const std::string& source)
@@ -535,7 +666,8 @@ static std::vector<MtaScriptEntry> parseMtaScriptEntries(const Uri& metaUri, con
     return entries;
 }
 
-static std::optional<std::string> extractTypedGlobalsPrelude(const std::string& source)
+static std::optional<std::string> extractTypedGlobalsPrelude(
+    const std::string& source, const std::string& providerTag, bool emitSharedTypeAliases)
 {
     auto normalizeTypeAliasForLocalScope = [](std::string alias) {
         size_t i = 0;
@@ -567,6 +699,7 @@ static std::optional<std::string> extractTypedGlobalsPrelude(const std::string& 
         return std::nullopt;
 
     std::vector<std::string> typeAliases;
+    std::vector<std::pair<std::string, std::string>> sharedTypeAliases;
     std::vector<std::pair<std::string, std::string>> globalTypeBodies;
     std::vector<OopClassBinding> oopClassBindings;
     std::unordered_map<std::string, std::string> localToOopGlobal;
@@ -601,7 +734,13 @@ static std::optional<std::string> extractTypedGlobalsPrelude(const std::string& 
         if (auto* alias = stat->as<Luau::AstStatTypeAlias>())
         {
             if (auto slice = sourceSliceFromLocation(source, alias->location))
-                typeAliases.push_back(normalizeTypeAliasForLocalScope(*slice));
+            {
+                std::string normalizedAlias = normalizeTypeAliasForLocalScope(*slice);
+                typeAliases.push_back(normalizedAlias);
+
+                if (auto aliasName = astNameToString(alias->name))
+                    sharedTypeAliases.emplace_back(*aliasName, std::move(normalizedAlias));
+            }
             continue;
         }
 
@@ -642,9 +781,7 @@ static std::optional<std::string> extractTypedGlobalsPrelude(const std::string& 
         {
             if (auto* global = fn->name->as<Luau::AstExprGlobal>())
             {
-                if (auto functionSlice = sourceSliceFromLocation(source, fn->func->location))
-                    if (auto normalizedFunction = normalizeFunctionExpressionSlice(*functionSlice))
-                        globalTypeBodies.emplace_back(global->name.value, "return " + *normalizedFunction);
+                globalTypeBodies.emplace_back(global->name.value, "return (nil :: any) :: " + buildFunctionTypeFromAst(source, fn->func));
             }
 
             if (auto methodInfo = classPublicMethodName(fn->name))
@@ -652,22 +789,15 @@ static std::optional<std::string> extractTypedGlobalsPrelude(const std::string& 
                 const auto& [classLocalName, methodName] = *methodInfo;
                 if (auto it = localToOopGlobal.find(classLocalName); it != localToOopGlobal.end())
                 {
-                    if (auto functionSlice = sourceSliceFromLocation(source, fn->func->location))
-                    {
-                        auto normalizedFunction = normalizeFunctionExpressionSlice(*functionSlice);
-                        if (!normalizedFunction)
-                            continue;
+                    auto& methods = oopPublicMethodsByGlobal[it->second];
+                    bool methodExists = std::any_of(methods.begin(), methods.end(),
+                        [&](const auto& pair)
+                        {
+                            return pair.first == methodName;
+                        });
 
-                        auto& methods = oopPublicMethodsByGlobal[it->second];
-                        bool methodExists = std::any_of(methods.begin(), methods.end(),
-                            [&](const auto& pair)
-                            {
-                                return pair.first == methodName;
-                            });
-
-                        if (!methodExists)
-                            methods.emplace_back(methodName, *normalizedFunction);
-                    }
+                    if (!methodExists)
+                        methods.emplace_back(methodName, buildFunctionTypeFromAst(source, fn->func));
                 }
             }
         }
@@ -677,6 +807,19 @@ static std::optional<std::string> extractTypedGlobalsPrelude(const std::string& 
     prelude.reserve(512);
     prelude += "\n--!nolint\n";
 
+    std::unordered_set<std::string> seenSharedTypeAliases;
+    if (emitSharedTypeAliases)
+    {
+        for (const auto& [aliasName, aliasSource] : sharedTypeAliases)
+        {
+            if (!seenSharedTypeAliases.insert(aliasName).second)
+                continue;
+
+            prelude += aliasSource;
+            prelude += "\n";
+        }
+    }
+
     std::unordered_set<std::string> seen;
     size_t index = 0;
     for (const auto& [name, typeBody] : globalTypeBodies)
@@ -684,7 +827,7 @@ static std::optional<std::string> extractTypedGlobalsPrelude(const std::string& 
         if (!seen.insert(name).second)
             continue;
 
-        prelude += "type __lsp_mta_global_" + std::to_string(index++) + " = typeof((function()\n";
+        prelude += "type __lsp_mta_global_" + providerTag + "_" + std::to_string(index++) + " = typeof((function()\n";
         for (const auto& alias : typeAliases)
         {
             prelude += alias;
@@ -692,9 +835,10 @@ static std::optional<std::string> extractTypedGlobalsPrelude(const std::string& 
         }
         prelude += typeBody;
         prelude += "\nend)())\n";
+        prelude += "local ";
         prelude += name;
         prelude += " = (nil :: any) :: __lsp_mta_global_";
-        prelude += std::to_string(index - 1);
+        prelude += providerTag + "_" + std::to_string(index - 1);
         prelude += "\n";
     }
 
@@ -704,8 +848,8 @@ static std::optional<std::string> extractTypedGlobalsPrelude(const std::string& 
         if (!seen.insert(binding.globalName).second)
             continue;
 
-        const std::string publicTypeName = "__lsp_mta_oop_public_" + std::to_string(oopIndex);
-        const std::string classTypeName = "__lsp_mta_oop_class_" + std::to_string(oopIndex);
+        const std::string publicTypeName = "__lsp_mta_oop_public_" + providerTag + "_" + std::to_string(oopIndex);
+        const std::string classTypeName = "__lsp_mta_oop_class_" + providerTag + "_" + std::to_string(oopIndex);
 
         if (binding.explicitPublicType)
         {
@@ -728,19 +872,15 @@ static std::optional<std::string> extractTypedGlobalsPrelude(const std::string& 
             {
                 for (size_t methodIndex = 0; methodIndex < methodsIt->second.size(); ++methodIndex)
                 {
-                    const auto& [methodName, functionSlice] = methodsIt->second[methodIndex];
+                    const auto& [methodName, functionType] = methodsIt->second[methodIndex];
                     const std::string methodTypeName =
-                        "__lsp_mta_oop_method_" + std::to_string(oopIndex) + "_" + std::to_string(methodIndex);
+                        "__lsp_mta_oop_method_" + providerTag + "_" + std::to_string(oopIndex) + "_" + std::to_string(methodIndex);
 
-                    prelude += "type " + methodTypeName + " = typeof((function()\n";
-                    for (const auto& alias : typeAliases)
-                    {
-                        prelude += alias;
-                        prelude += "\n";
-                    }
-                    prelude += "return ";
-                    prelude += functionSlice;
-                    prelude += "\nend)())\n";
+                    prelude += "type ";
+                    prelude += methodTypeName;
+                    prelude += " = ";
+                    prelude += functionType;
+                    prelude += "\n";
                 }
             }
 
@@ -754,7 +894,7 @@ static std::optional<std::string> extractTypedGlobalsPrelude(const std::string& 
                 {
                     const auto& [methodName, _] = methodsIt->second[methodIndex];
                     const std::string methodTypeName =
-                        "__lsp_mta_oop_method_" + std::to_string(oopIndex) + "_" + std::to_string(methodIndex);
+                        "__lsp_mta_oop_method_" + providerTag + "_" + std::to_string(oopIndex) + "_" + std::to_string(methodIndex);
 
                     prelude += "    ";
                     prelude += methodName;
@@ -784,6 +924,7 @@ static std::optional<std::string> extractTypedGlobalsPrelude(const std::string& 
         prelude += ",\n";
         prelude += "}\n";
 
+        prelude += "local ";
         prelude += binding.globalName;
         prelude += " = (nil :: any) :: ";
         prelude += classTypeName;
@@ -823,6 +964,7 @@ static std::optional<std::string> extractTypedGlobalsPrelude(const std::string& 
 
             if (k < lineEnd && source[k] == '=' && seen.insert(name).second)
             {
+                prelude += "local ";
                 prelude += name;
                 prelude += " = nil :: any\n";
             }
@@ -833,7 +975,7 @@ static std::optional<std::string> extractTypedGlobalsPrelude(const std::string& 
         lineStart = lineEnd + 1;
     }
 
-    if (seen.empty())
+    if (seen.empty() && seenSharedTypeAliases.empty())
         return std::nullopt;
 
     return prelude;
@@ -1014,6 +1156,7 @@ std::optional<std::string> WorkspaceFileResolver::buildMtaGlobalDeclarations(con
 
     std::unordered_set<std::string> seenFilePaths;
     std::string declarations;
+    size_t providerOrdinal = 0;
 
     std::unordered_set<std::string> targetGlobalFunctions;
     if (auto targetSource = readSourceForUri(uri))
@@ -1027,9 +1170,6 @@ std::optional<std::string> WorkspaceFileResolver::buildMtaGlobalDeclarations(con
             continue;
 
         std::string providerPath = normalizePath(entry.uri.fsPath());
-        if (providerPath == targetPath)
-            continue;
-
         if (!seenFilePaths.insert(providerPath).second)
             continue;
 
@@ -1038,10 +1178,11 @@ std::optional<std::string> WorkspaceFileResolver::buildMtaGlobalDeclarations(con
         if (!providerSource)
             continue;
 
-        if (auto prelude = extractTypedGlobalsPrelude(*providerSource))
+        bool emitSharedTypeAliases = providerPath != targetPath;
+        if (auto prelude = extractTypedGlobalsPrelude(*providerSource, std::to_string(providerOrdinal++), emitSharedTypeAliases))
             declarations += *prelude;
 
-        if (!targetGlobalFunctions.empty())
+        if (!targetGlobalFunctions.empty() && providerPath != targetPath)
         {
             auto references = extractReferencedGlobalNames(*providerSource, targetGlobalFunctions);
             targetGlobalFunctionReferences.insert(references.begin(), references.end());
@@ -1124,6 +1265,81 @@ bool WorkspaceFileResolver::isMtaGlobalFunctionUsedOutsideFile(const Uri& uri, c
 
         auto references = extractReferencedGlobalNames(*providerSource, tracked);
         if (references.count(functionName))
+            return true;
+
+        if (hasLikelyGlobalFunctionCall(*providerSource, functionName))
+            return true;
+    }
+
+    return false;
+}
+
+bool WorkspaceFileResolver::isMtaGlobalFunctionDefinedOutsideFile(const Uri& uri, const std::string& functionName) const
+{
+    if (!isIdentifier(functionName))
+        return false;
+
+    auto metaUri = findResourceMetaFile(uri);
+    if (!metaUri)
+        return false;
+
+    auto metaSource = Luau::FileUtils::readFile(metaUri->fsPath());
+    if (!metaSource)
+        return false;
+
+    auto scriptEntries = parseMtaScriptEntries(*metaUri, *metaSource);
+    if (scriptEntries.empty())
+        return false;
+
+    const auto targetPath = normalizePath(uri.fsPath());
+    MTAScriptType targetType = MTAScriptType::Unknown;
+    for (const auto& entry : scriptEntries)
+    {
+        if (normalizePath(entry.uri.fsPath()) == targetPath)
+        {
+            targetType = entry.type;
+            break;
+        }
+    }
+
+    if (targetType == MTAScriptType::Unknown)
+        return false;
+
+    auto readSourceForUri = [&](const Uri& sourceUri) -> std::optional<std::string>
+    {
+        std::string sourcePath = normalizePath(sourceUri.fsPath());
+
+        if (auto* managed = getManagedTextDocument(sourceUri))
+            return managed->getText();
+
+        for (const auto& [managedUri, managedDoc] : managedFiles)
+        {
+            if (normalizePath(managedUri.fsPath()) == sourcePath)
+                return managedDoc.getText();
+        }
+
+        return Luau::FileUtils::readFile(sourceUri.fsPath());
+    };
+
+    std::unordered_set<std::string> seenFilePaths;
+    for (const auto& entry : scriptEntries)
+    {
+        if (!canSeeScriptType(targetType, entry.type))
+            continue;
+
+        std::string providerPath = normalizePath(entry.uri.fsPath());
+        if (providerPath == targetPath)
+            continue;
+
+        if (!seenFilePaths.insert(providerPath).second)
+            continue;
+
+        auto providerSource = readSourceForUri(entry.uri);
+        if (!providerSource)
+            continue;
+
+        auto globals = extractTopLevelGlobalFunctionNames(*providerSource);
+        if (globals.count(functionName))
             return true;
     }
 

@@ -78,4 +78,39 @@ TEST_CASE("language_server_can_process_string_ids")
     REQUIRE(client.errorQueue.empty());
 }
 
+TEST_CASE("language_server_eagerly_processes_diagnostics_on_did_open_in_pull_mode")
+{
+    TestClient client;
+    client.globalConfig.index.enabled = false;
+
+    LanguageServer server(&client, std::nullopt);
+
+    auto workspaceUri = Uri::file("project");
+
+    lsp::InitializeParams initializeParams;
+    initializeParams.capabilities.textDocument = lsp::TextDocumentClientCapabilities{};
+    initializeParams.capabilities.textDocument->diagnostic = lsp::DiagnosticClientCapabilities{};
+
+    std::vector<lsp::WorkspaceFolder> workspaceFolders;
+    workspaceFolders.emplace_back(lsp::WorkspaceFolder{workspaceUri, "project"});
+    initializeParams.workspaceFolders = workspaceFolders;
+
+    server.onRequest(0, "initialize", initializeParams);
+    server.onNotification("initialized", std::make_optional(lsp::InitializedParams{}));
+
+    auto uri = workspaceUri.resolvePath("example.luau");
+
+    lsp::DidOpenTextDocumentParams openParams;
+    openParams.textDocument = {uri, "luau", 0, "local x: string = 5"};
+    server.onNotification("textDocument/didOpen", std::make_optional(openParams));
+
+    auto workspaceFolder = server.findWorkspace(uri, /* shouldInitialize= */ false);
+    REQUIRE(workspaceFolder);
+
+    auto moduleName = workspaceFolder->fileResolver.getModuleName(uri);
+    CHECK(workspaceFolder->frontend.getSourceModule(moduleName) != nullptr);
+
+    server.shutdown();
+}
+
 TEST_SUITE_END();

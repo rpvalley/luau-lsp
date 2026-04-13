@@ -31,6 +31,21 @@ static std::optional<std::string> extractUnusedFunctionName(const std::string& m
     return message.substr(start, end - start);
 }
 
+static std::optional<std::string> extractUnknownGlobalName(const std::string& message)
+{
+    static const std::string needle = "Unknown global '";
+    size_t startNeedle = message.find(needle);
+    if (startNeedle == std::string::npos)
+        return std::nullopt;
+
+    size_t start = startNeedle + needle.size();
+    size_t end = message.find("'", start);
+    if (end == std::string::npos || end <= start)
+        return std::nullopt;
+
+    return message.substr(start, end - start);
+}
+
 /// Compute a document diagnostics report for a single file (and potentially related files)
 /// By default, this is called by the client for an open document. Hence we can expect that files are managed
 /// However, we sometimes call this as part of reverse-dependency updates (see updateTextDocument), where the file may be unmanaged
@@ -84,6 +99,13 @@ lsp::DocumentDiagnosticReport WorkspaceFolder::documentDiagnostics(
         if (error.moduleName == moduleName)
         {
             auto diagnostic = createTypeErrorDiagnostic(error, &fileResolver, *textDocument);
+
+            if (auto unknownGlobal = extractUnknownGlobalName(diagnostic.message))
+            {
+                if (fileResolver.isMtaGlobalFunctionDefinedOutsideFile(params.textDocument.uri, *unknownGlobal))
+                    continue;
+            }
+
             report.items.emplace_back(diagnostic);
         }
         else if (supportsRelatedDocuments(client->capabilities))
@@ -116,6 +138,13 @@ lsp::DocumentDiagnosticReport WorkspaceFolder::documentDiagnostics(
     for (auto& error : cr.lintResult.errors)
     {
         auto diagnostic = createLintDiagnostic(error, *textDocument);
+
+        if (auto functionName = extractUnusedFunctionName(diagnostic.message))
+        {
+            if (fileResolver.isMtaGlobalFunctionUsedOutsideFile(params.textDocument.uri, *functionName))
+                continue;
+        }
+
         diagnostic.severity = lsp::DiagnosticSeverity::Error; // Report this as an error instead
         report.items.emplace_back(diagnostic);
     }
@@ -211,6 +240,13 @@ lsp::WorkspaceDiagnosticReport WorkspaceFolder::workspaceDiagnostics(const lsp::
             if (error.moduleName == moduleName)
             {
                 auto diagnostic = createTypeErrorDiagnostic(error, &fileResolver, document);
+
+                if (auto unknownGlobal = extractUnknownGlobalName(diagnostic.message))
+                {
+                    if (fileResolver.isMtaGlobalFunctionDefinedOutsideFile(uri, *unknownGlobal))
+                        continue;
+                }
+
                 documentReport.items.emplace_back(diagnostic);
             }
         }
@@ -219,6 +255,13 @@ lsp::WorkspaceDiagnosticReport WorkspaceFolder::workspaceDiagnostics(const lsp::
         for (auto& error : cr.lintResult.errors)
         {
             auto diagnostic = createLintDiagnostic(error, document);
+
+            if (auto functionName = extractUnusedFunctionName(diagnostic.message))
+            {
+                if (fileResolver.isMtaGlobalFunctionUsedOutsideFile(uri, *functionName))
+                    continue;
+            }
+
             diagnostic.severity = lsp::DiagnosticSeverity::Error; // Report this as an error instead
             documentReport.items.emplace_back(diagnostic);
         }

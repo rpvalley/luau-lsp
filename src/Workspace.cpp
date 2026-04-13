@@ -14,6 +14,7 @@
 #include "glob/match.h"
 #include "Luau/BuiltinDefinitions.h"
 #include "Luau/NotNull.h"
+#include "Luau/Parser.h"
 #include "Luau/TimeTrace.h"
 #include "LuauFileUtils.hpp"
 
@@ -32,13 +33,18 @@ static bool shouldTypecheckModule(const WorkspaceFileResolver& fileResolver, con
 
 static bool hasLuaDefinitionSuffix(const std::string& path)
 {
-    constexpr const char* kSuffix = ".d.lua";
-    constexpr size_t kSuffixLen = 6;
+    constexpr const char* kLuaSuffix = ".d.lua";
+    constexpr const char* kLuauSuffix = ".d.luau";
+    constexpr size_t kLuaSuffixLen = 6;
+    constexpr size_t kLuauSuffixLen = 7;
 
-    if (path.size() < kSuffixLen)
-        return false;
+    if (path.size() >= kLuaSuffixLen && path.compare(path.size() - kLuaSuffixLen, kLuaSuffixLen, kLuaSuffix) == 0)
+        return true;
 
-    return path.compare(path.size() - kSuffixLen, kSuffixLen, kSuffix) == 0;
+    if (path.size() >= kLuauSuffixLen && path.compare(path.size() - kLuauSuffixLen, kLuauSuffixLen, kLuauSuffix) == 0)
+        return true;
+
+    return false;
 }
 
 static std::string normalizeDefinitionPathForKey(const std::string& path)
@@ -52,6 +58,141 @@ static std::string normalizeDefinitionPathForKey(const std::string& path)
         });
 #endif
     return normalized;
+}
+
+static std::optional<size_t> sourceOffsetFromPosition(const std::string& source, const Luau::Position& position)
+{
+    size_t line = 0;
+    size_t offset = 0;
+
+    while (line < position.line)
+    {
+        size_t next = source.find('\n', offset);
+        if (next == std::string::npos)
+            return std::nullopt;
+        offset = next + 1;
+        ++line;
+    }
+
+    if (offset + position.column > source.size())
+        return std::nullopt;
+
+    return offset + position.column;
+}
+
+static std::optional<std::string> sourceSliceFromLocation(const std::string& source, const Luau::Location& location)
+{
+    auto start = sourceOffsetFromPosition(source, location.begin);
+    auto end = sourceOffsetFromPosition(source, location.end);
+    if (!start || !end || *start > *end || *end > source.size())
+        return std::nullopt;
+
+    return source.substr(*start, *end - *start);
+}
+
+static std::string normalizeTypeAliasForDefinitions(std::string alias)
+{
+    size_t i = 0;
+    while (i < alias.size() && std::isspace(static_cast<unsigned char>(alias[i])))
+        ++i;
+
+    constexpr const char* exportTypePrefix = "export type";
+    constexpr size_t exportTypePrefixLen = 11;
+    if (alias.size() >= i + exportTypePrefixLen && alias.compare(i, exportTypePrefixLen, exportTypePrefix) == 0)
+        alias.replace(i, exportTypePrefixLen, "type");
+
+    return alias;
+}
+
+static std::vector<std::pair<std::string, std::string>> extractExportedTypeAliasesFromSource(const std::string& source)
+{
+    std::vector<std::pair<std::string, std::string>> aliases;
+
+    Luau::Allocator allocator;
+    Luau::AstNameTable names{allocator};
+    Luau::ParseOptions options;
+    Luau::ParseResult parseResult = Luau::Parser::parse(source.c_str(), source.size(), names, allocator, options);
+    if (!parseResult.root)
+        return aliases;
+
+    for (Luau::AstStat* stat : parseResult.root->body)
+    {
+        auto* typeAlias = stat->as<Luau::AstStatTypeAlias>();
+        if (!typeAlias || !typeAlias->exported || !typeAlias->name.value)
+            continue;
+
+        if (auto slice = sourceSliceFromLocation(source, typeAlias->location))
+            aliases.emplace_back(typeAlias->name.value, normalizeTypeAliasForDefinitions(*slice));
+    }
+
+    return aliases;
+}
+
+static std::unordered_set<std::string> extractTypeAliasNamesFromSource(const std::string& source)
+{
+    std::unordered_set<std::string> names;
+
+    Luau::Allocator allocator;
+    Luau::AstNameTable astNames{allocator};
+    Luau::ParseOptions options;
+    Luau::ParseResult parseResult = Luau::Parser::parse(source.c_str(), source.size(), astNames, allocator, options);
+    if (!parseResult.root)
+        return names;
+
+    for (Luau::AstStat* stat : parseResult.root->body)
+    {
+        auto* typeAlias = stat->as<Luau::AstStatTypeAlias>();
+        if (typeAlias && typeAlias->name.value)
+            names.insert(typeAlias->name.value);
+    }
+
+    return names;
+}
+
+static std::vector<std::pair<std::string, std::string>> discoverWorkspaceExportedTypeAliases(const Uri& rootUri)
+{
+    std::vector<std::pair<std::string, std::string>> aliases;
+
+    if (rootUri.scheme != "file" || !rootUri.exists() || !rootUri.isDirectory())
+        return aliases;
+
+    std::unordered_set<std::string> seenNames;
+    Luau::FileUtils::traverseDirectoryRecursive(rootUri.fsPath(),
+        [&](const std::string& path)
+        {
+            Uri uri = Uri::file(path);
+            auto ext = uri.extension();
+            if (ext != ".lua" && ext != ".luau")
+                return;
+
+            auto source = Luau::FileUtils::readFile(path);
+            if (!source)
+                return;
+
+            for (auto& [name, aliasSource] : extractExportedTypeAliasesFromSource(*source))
+            {
+                if (seenNames.insert(name).second)
+                    aliases.emplace_back(std::move(name), std::move(aliasSource));
+            }
+        });
+
+    return aliases;
+}
+
+static std::string buildSharedExportedTypeAliasesPrelude(
+    const std::vector<std::pair<std::string, std::string>>& aliases, const std::unordered_set<std::string>& excludedNames)
+{
+    std::string prelude;
+    for (const auto& [name, aliasSource] : aliases)
+    {
+        if (excludedNames.count(name))
+            continue;
+
+        prelude += aliasSource;
+        prelude += "\n";
+    }
+
+    return prelude;
 }
 
 static std::vector<std::pair<std::string, std::string>> discoverWorkspaceDefinitionFiles(const Uri& rootUri)
@@ -530,6 +671,9 @@ bool WorkspaceFolder::isIgnoredFileForAutoImports(const Uri& uri, const std::opt
 
 bool WorkspaceFolder::isDefinitionFile(const Uri& path, const std::optional<ClientConfiguration>& givenConfig) const
 {
+    if (hasLuaDefinitionSuffix(path.fsPath()))
+        return true;
+
     auto config = givenConfig ? *givenConfig : client->getConfiguration(rootUri);
 
     for (auto& [_, file] : config.types.definitionFiles)
@@ -673,7 +817,7 @@ void WorkspaceFolder::indexFiles(const ClientConfiguration& config)
 
                 auto uri = Uri::file(path);
                 auto ext = uri.extension();
-                if ((ext == ".lua" || ext == ".luau") && !isDefinitionFile(uri, config) && !isIgnoredFile(uri, config))
+                if ((ext == ".lua" || ext == ".luau") && !isIgnoredFile(uri, config))
                 {
                     auto moduleName = fileResolver.getModuleName(uri);
                     moduleNames.emplace_back(moduleName);
@@ -840,8 +984,9 @@ void WorkspaceFolder::registerTypes(const std::vector<std::string>& disabledGlob
         tryAddDefinition(packageName, definitionsFile);
 
     if (definitionsFilesToProcess.empty())
-        client->sendLogMessage(lsp::MessageType::Warning, "No definitions file provided by client or found in workspace (*.d.lua)");
+        client->sendLogMessage(lsp::MessageType::Warning, "No definitions file provided by client or found in workspace (*.d.lua, *.d.luau)");
 
+    auto sharedExportedTypeAliases = discoverWorkspaceExportedTypeAliases(rootUri);
     std::vector<std::string> exportsEntriesToMerge;
 
     for (const auto& [packageName, definitionsFile] : definitionsFilesToProcess)
@@ -867,15 +1012,34 @@ void WorkspaceFolder::registerTypes(const std::vector<std::string>& disabledGlob
         auto extraction = extractExportsDeclarations(*definitionsContents);
         exportsEntriesToMerge.insert(exportsEntriesToMerge.end(), extraction.entries.begin(), extraction.entries.end());
 
-        std::string sourceForRegistration = std::move(extraction.transformedSource);
-        if (trimWhitespace(sourceForRegistration).empty())
+        std::string baseSourceForRegistration = std::move(extraction.transformedSource);
+        if (trimWhitespace(baseSourceForRegistration).empty())
         {
             client->publishDiagnostics({Uri::file(resolvedFilePath), std::nullopt, {}});
             continue;
         }
 
+        std::string sourceForRegistration = baseSourceForRegistration;
+        bool addedSharedTypePrelude = false;
+        if (!sharedExportedTypeAliases.empty())
+        {
+            auto localTypeAliasNames = extractTypeAliasNamesFromSource(baseSourceForRegistration);
+            auto sharedTypePrelude = buildSharedExportedTypeAliasesPrelude(sharedExportedTypeAliases, localTypeAliasNames);
+            if (!sharedTypePrelude.empty())
+            {
+                sourceForRegistration = sharedTypePrelude + sourceForRegistration;
+                addedSharedTypePrelude = true;
+            }
+        }
+
         client->sendTrace("workspace initialization: registering types definition");
         auto result = loadDefinitionFile(packageName, sourceForRegistration, metadata);
+        if (!result.success && addedSharedTypePrelude)
+        {
+            client->sendTrace("workspace initialization: retrying definitions registration without shared exported type prelude", resolvedFilePath);
+            sourceForRegistration = baseSourceForRegistration;
+            result = loadDefinitionFile(packageName, sourceForRegistration, metadata);
+        }
         client->sendTrace("workspace initialization: registering types definition COMPLETED");
 
         auto uri = Uri::file(resolvedFilePath);
@@ -891,8 +1055,8 @@ void WorkspaceFolder::registerTypes(const std::vector<std::string>& disabledGlob
         }
         else
         {
-            client->sendWindowMessage(
-                lsp::MessageType::Error, "Failed to read definitions file " + resolvedFilePath + ". Extended types will not be provided");
+            client->sendWindowMessage(lsp::MessageType::Error,
+                "Failed to load definitions file " + resolvedFilePath + ". Extended types will not be provided");
 
             // Display relevant diagnostics
             std::vector<lsp::Diagnostic> diagnostics;

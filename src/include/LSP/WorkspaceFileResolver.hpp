@@ -101,7 +101,7 @@ public:
 
     WorkspaceFileResolver()
     {
-        defaultConfig.mode = Luau::Mode::Nonstrict;
+        defaultConfig.mode = Luau::Mode::Strict;
     }
 
     // Create a WorkspaceFileResolver with a specific default configuration
@@ -150,6 +150,9 @@ public:
 
     /// Returns true if a global function is referenced by another visible MTA script in the same resource.
     bool isMtaGlobalFunctionUsedOutsideFile(const Uri& uri, const std::string& functionName) const;
+
+    /// Returns true if a global function is defined in another visible MTA script in the same resource.
+    bool isMtaGlobalFunctionDefinedOutsideFile(const Uri& uri, const std::string& functionName) const;
 
     // Plugin environment support
     bool isPluginFile(const Luau::ModuleName& name) const;

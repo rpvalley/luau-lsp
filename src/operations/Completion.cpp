@@ -1,3 +1,4 @@
+#include <cctype>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -41,6 +42,267 @@ struct MetatableCompletionInfo
     std::unordered_map<std::string, std::unordered_set<std::string>> methodsByClass;
     std::vector<MetatableMethodScope> methodScopes;
 };
+
+static std::optional<std::string> extractOopDefinitionPublicTypeName(const Luau::AstExpr* expr)
+{
+    const auto* asserted = expr->as<Luau::AstExprTypeAssertion>();
+    if (!asserted)
+        return std::nullopt;
+
+    const auto* annotationRef = asserted->annotation->as<Luau::AstTypeReference>();
+    if (!annotationRef || !annotationRef->name.value || std::string(annotationRef->name.value) != "OopDefinitionOf")
+        return std::nullopt;
+
+    if (annotationRef->parameters.size == 0 || !annotationRef->parameters.data[0].type)
+        return std::nullopt;
+
+    const auto* publicTypeRef = annotationRef->parameters.data[0].type->as<Luau::AstTypeReference>();
+    if (!publicTypeRef || publicTypeRef->prefix || !publicTypeRef->name.value)
+        return std::nullopt;
+
+    return std::string(publicTypeRef->name.value);
+}
+
+static std::unordered_map<std::string, std::string> collectOopClassPublicTypeNames(const Luau::SourceModule& sourceModule)
+{
+    std::unordered_map<std::string, std::string> mapping;
+
+    for (Luau::AstStat* stat : sourceModule.root->body)
+    {
+        if (auto* local = stat->as<Luau::AstStatLocal>())
+        {
+            size_t pairCount = std::min(local->vars.size, local->values.size);
+            for (size_t i = 0; i < pairCount; ++i)
+            {
+                if (!local->vars.data[i]->name.value)
+                    continue;
+
+                if (auto publicTypeName = extractOopDefinitionPublicTypeName(local->values.data[i]))
+                    mapping[local->vars.data[i]->name.value] = *publicTypeName;
+            }
+            continue;
+        }
+
+        if (auto* assign = stat->as<Luau::AstStatAssign>())
+        {
+            size_t pairCount = std::min(assign->vars.size, assign->values.size);
+            for (size_t i = 0; i < pairCount; ++i)
+            {
+                auto publicTypeName = extractOopDefinitionPublicTypeName(assign->values.data[i]);
+                if (!publicTypeName)
+                    continue;
+
+                if (const auto* localVar = assign->vars.data[i]->as<Luau::AstExprLocal>())
+                {
+                    if (localVar->local && localVar->local->name.value)
+                        mapping[localVar->local->name.value] = *publicTypeName;
+                }
+                else if (const auto* globalVar = assign->vars.data[i]->as<Luau::AstExprGlobal>())
+                {
+                    if (globalVar->name.value)
+                        mapping[globalVar->name.value] = *publicTypeName;
+                }
+            }
+        }
+    }
+
+    return mapping;
+}
+
+static void collectMethodNamesFromType(
+    const Luau::AstType* type, const std::unordered_map<std::string, const Luau::AstType*>& aliases, std::unordered_set<std::string>& seenAliases,
+    std::unordered_set<std::string>& methods)
+{
+    if (!type)
+        return;
+
+    if (const auto* tableType = type->as<Luau::AstTypeTable>())
+    {
+        for (const auto& prop : tableType->props)
+        {
+            if (prop.name.value && prop.type && prop.type->is<Luau::AstTypeFunction>())
+                methods.insert(prop.name.value);
+        }
+        return;
+    }
+
+    if (const auto* intersectionType = type->as<Luau::AstTypeIntersection>())
+    {
+        for (Luau::AstType* part : intersectionType->types)
+            collectMethodNamesFromType(part, aliases, seenAliases, methods);
+        return;
+    }
+
+    if (const auto* refType = type->as<Luau::AstTypeReference>())
+    {
+        if (refType->prefix || !refType->name.value)
+            return;
+
+        std::string name = refType->name.value;
+        if (!seenAliases.insert(name).second)
+            return;
+
+        if (auto it = aliases.find(name); it != aliases.end())
+            collectMethodNamesFromType(it->second, aliases, seenAliases, methods);
+    }
+}
+
+static std::unordered_set<std::string> collectPublicTypeMethodNames(const Luau::SourceModule& sourceModule, const std::string& publicTypeName)
+{
+    std::unordered_map<std::string, const Luau::AstType*> aliases;
+    for (Luau::AstStat* stat : sourceModule.root->body)
+    {
+        if (auto* typeAlias = stat->as<Luau::AstStatTypeAlias>())
+        {
+            if (typeAlias->name.value)
+                aliases[typeAlias->name.value] = typeAlias->type;
+        }
+    }
+
+    std::unordered_set<std::string> methods;
+    std::unordered_set<std::string> seenAliases;
+
+    if (auto it = aliases.find(publicTypeName); it != aliases.end())
+        collectMethodNamesFromType(it->second, aliases, seenAliases, methods);
+
+    return methods;
+}
+
+static std::optional<std::string> extractFunctionPublicReceiver(const TextDocument& textDocument, const lsp::Position& position)
+{
+    std::string line = textDocument.getLine(position.line);
+    size_t column = std::min<size_t>(position.character, line.size());
+    std::string prefix = line.substr(0, column);
+
+    while (!prefix.empty() && std::isspace(static_cast<unsigned char>(prefix.back())))
+        prefix.pop_back();
+
+    if (prefix.empty() || prefix.back() != ':')
+        return std::nullopt;
+
+    prefix.pop_back();
+    while (!prefix.empty() && std::isspace(static_cast<unsigned char>(prefix.back())))
+        prefix.pop_back();
+
+    const std::string publicSuffix = ".public";
+    if (prefix.size() <= publicSuffix.size() || prefix.substr(prefix.size() - publicSuffix.size()) != publicSuffix)
+        return std::nullopt;
+
+    prefix.resize(prefix.size() - publicSuffix.size());
+    while (!prefix.empty() && std::isspace(static_cast<unsigned char>(prefix.back())))
+        prefix.pop_back();
+
+    while (!prefix.empty() && std::isspace(static_cast<unsigned char>(prefix.front())))
+        prefix.erase(prefix.begin());
+
+    const std::string functionPrefix = "function ";
+    if (prefix.rfind(functionPrefix, 0) != 0)
+        return std::nullopt;
+
+    std::string receiver = prefix.substr(functionPrefix.size());
+    if (!Luau::isIdentifier(receiver))
+        return std::nullopt;
+
+    return receiver;
+}
+
+static std::optional<std::string> extractFunctionDotReceiver(const TextDocument& textDocument, const lsp::Position& position)
+{
+    std::string line = textDocument.getLine(position.line);
+    size_t column = std::min<size_t>(position.character, line.size());
+    std::string prefix = line.substr(0, column);
+
+    while (!prefix.empty() && std::isspace(static_cast<unsigned char>(prefix.back())))
+        prefix.pop_back();
+
+    if (prefix.empty() || prefix.back() != '.')
+        return std::nullopt;
+
+    prefix.pop_back();
+    while (!prefix.empty() && std::isspace(static_cast<unsigned char>(prefix.back())))
+        prefix.pop_back();
+
+    while (!prefix.empty() && std::isspace(static_cast<unsigned char>(prefix.front())))
+        prefix.erase(prefix.begin());
+
+    const std::string functionPrefix = "function ";
+    if (prefix.rfind(functionPrefix, 0) != 0)
+        return std::nullopt;
+
+    std::string receiver = prefix.substr(functionPrefix.size());
+    if (!Luau::isIdentifier(receiver))
+        return std::nullopt;
+
+    return receiver;
+}
+
+static void addTypedClassDeclarationSuggestions(const TextDocument& textDocument, const lsp::Position& position,
+    const Luau::SourceModule& sourceModule, std::vector<lsp::CompletionItem>& items)
+{
+    auto receiver = extractFunctionDotReceiver(textDocument, position);
+    if (!receiver)
+        return;
+
+    auto classToType = collectOopClassPublicTypeNames(sourceModule);
+    if (!classToType.count(*receiver))
+        return;
+
+    std::unordered_set<std::string> existingLabels;
+    existingLabels.reserve(items.size());
+    for (const auto& item : items)
+        existingLabels.insert(item.label);
+
+    auto addItem = [&](const std::string& label)
+    {
+        if (!existingLabels.insert(label).second)
+            return;
+
+        lsp::CompletionItem item;
+        item.label = label;
+        item.kind = lsp::CompletionItemKind::Field;
+        item.detail = "metatable class member";
+        items.push_back(std::move(item));
+    };
+
+    addItem("public");
+    addItem("private");
+    addItem("protected");
+}
+
+static void addTypedPublicMethodDeclarationSuggestions(
+    const Luau::AutocompleteResult& result, const TextDocument& textDocument, const lsp::Position& position,
+    const Luau::SourceModule& sourceModule, std::vector<lsp::CompletionItem>& items)
+{
+    auto receiver = extractFunctionPublicReceiver(textDocument, position);
+    if (!receiver)
+        return;
+
+    auto classToType = collectOopClassPublicTypeNames(sourceModule);
+    auto classIt = classToType.find(*receiver);
+    if (classIt == classToType.end())
+        return;
+
+    auto methodNames = collectPublicTypeMethodNames(sourceModule, classIt->second);
+    if (methodNames.empty())
+        return;
+
+    std::unordered_set<std::string> existingLabels;
+    existingLabels.reserve(items.size());
+    for (const auto& item : items)
+        existingLabels.insert(item.label);
+
+    for (const auto& methodName : methodNames)
+    {
+        if (!existingLabels.insert(methodName).second)
+            continue;
+
+        lsp::CompletionItem item;
+        item.label = methodName;
+        item.kind = lsp::CompletionItemKind::Method;
+        item.detail = "typed public method";
+        items.push_back(std::move(item));
+    }
+}
 
 static std::optional<std::string> astNameToString(const Luau::AstName& name)
 {
@@ -258,6 +520,79 @@ static void addMetatableCompletions(const Luau::AutocompleteResult& result, cons
                 addCustomCompletionItem(items, existingLabels, methodName, lsp::CompletionItemKind::Method, "metatable public method");
         }
     }
+}
+
+static void addFallbackExportedTypeSuggestions(
+    WorkspaceFolder* workspace, const Luau::ModuleName& currentModuleName, std::vector<lsp::CompletionItem>& items)
+{
+    std::unordered_set<std::string> existingLabels;
+    existingLabels.reserve(items.size());
+    for (const auto& item : items)
+        existingLabels.insert(item.label);
+
+    std::unordered_set<std::string> seenTypes;
+
+    for (const auto& [moduleName, sourceModule] : workspace->frontend.sourceModules)
+    {
+        if (!sourceModule || !sourceModule->root)
+            continue;
+
+        for (Luau::AstStat* stat : sourceModule->root->body)
+        {
+            auto* typeAlias = stat->as<Luau::AstStatTypeAlias>();
+            if (!typeAlias)
+                continue;
+
+            if (moduleName != currentModuleName && !typeAlias->exported)
+                continue;
+
+            if (!typeAlias->name.value)
+                continue;
+
+            std::string typeName = typeAlias->name.value;
+            if (typeName.rfind("__lsp_mta_", 0) == 0)
+                continue;
+
+            if (!seenTypes.insert(typeName).second)
+                continue;
+
+            if (!existingLabels.insert(typeName).second)
+                continue;
+
+            lsp::CompletionItem item;
+            item.label = typeName;
+            item.kind = lsp::CompletionItemKind::Interface;
+            item.detail = "type";
+            items.push_back(std::move(item));
+        }
+    }
+}
+
+static bool isLikelyTypeAnnotationPosition(const TextDocument& textDocument, const lsp::Position& position)
+{
+    std::string line = textDocument.getLine(position.line);
+    if (line.find("function ") != std::string::npos)
+        return false;
+
+    const std::string source = textDocument.getText();
+    size_t offset = textDocument.offsetAt(position);
+    if (offset == 0 || offset > source.size())
+        return false;
+
+    size_t i = offset;
+    while (i > 0)
+    {
+        char c = source[i - 1];
+        if (std::isspace(static_cast<unsigned char>(c)))
+        {
+            --i;
+            continue;
+        }
+
+        return c == ':';
+    }
+
+    return false;
 }
 
 void WorkspaceFolder::endAutocompletion(const lsp::CompletionParams& params)
@@ -1032,6 +1367,8 @@ std::vector<lsp::CompletionItem> WorkspaceFolder::completion(const lsp::Completi
         MetatableClassCollector collector;
         sourceModule->root->visit(&collector);
         addMetatableCompletions(result, position, items, collector.info);
+        addTypedClassDeclarationSuggestions(*textDocument, params.position, *sourceModule, items);
+        addTypedPublicMethodDeclarationSuggestions(result, *textDocument, params.position, *sourceModule, items);
     }
 
     if (config.completion.suggestImports || config.completion.imports.enabled)
@@ -1059,13 +1396,14 @@ std::vector<lsp::CompletionItem> WorkspaceFolder::completion(const lsp::Completi
         }
         else if (result.context == Luau::AutocompleteContext::Type)
         {
-            // Make sure we are in the context of completing a prefix in an AstTypeReference
-            if (auto node = result.ancestry.back())
-                if (auto typeReference = node->as<Luau::AstTypeReference>())
-                    if (!typeReference->prefix)
-                        suggestImports(moduleName, position, config, *textDocument, items, /* completingTypeReferencePrefix: */ true);
+            // Also suggest type imports in incomplete type positions (e.g. function type fields inside declarations)
+            suggestImports(moduleName, position, config, *textDocument, items, /* completingTypeReferencePrefix: */ true);
+            addFallbackExportedTypeSuggestions(this, moduleName, items);
         }
     }
+
+    if (isLikelyTypeAnnotationPosition(*textDocument, params.position))
+        addFallbackExportedTypeSuggestions(this, moduleName, items);
 
     return items;
 }

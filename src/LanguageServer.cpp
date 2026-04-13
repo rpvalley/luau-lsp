@@ -832,11 +832,23 @@ void LanguageServer::onDidOpenTextDocument(const lsp::DidOpenTextDocumentParams&
     auto workspace = findWorkspace(params.textDocument.uri);
     workspace->openTextDocument(params.textDocument.uri, params);
 
-    // Trigger diagnostics
-    // By default, we rely on the pull based diagnostics model (based on documentDiagnostic)
-    // however if a client doesn't yet support it, we push the diagnostics instead
+    // Trigger diagnostics.
+    // In push mode, publish diagnostics right away.
+    // In pull mode, eagerly compute diagnostics so newly opened files are processed immediately
+    // instead of waiting for a later pull cycle.
     if (!usingPullDiagnostics(client->capabilities))
         workspace->pushDiagnostics(params.textDocument.uri, params.textDocument.version);
+    else
+    {
+        try
+        {
+            workspace->documentDiagnostics(lsp::DocumentDiagnosticParams{{params.textDocument.uri}}, /* cancellationToken= */ nullptr);
+        }
+        catch (const JsonRpcException&)
+        {
+            // Ignore cancellation while the workspace is still configuring.
+        }
+    }
 }
 
 void LanguageServer::onDidChangeTextDocument(const lsp::DidChangeTextDocumentParams& params)
